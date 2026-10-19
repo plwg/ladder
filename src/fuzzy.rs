@@ -14,7 +14,9 @@ const PARALLEL_THRESHOLD: usize = 32_768;
 pub struct Item {
     pub text: String,
     hay: Utf32String,
-    /// Frecency bonus added to the match score (roughly one matched char at most).
+    /// Frequency + overall recency part of `bonus`.
+    base: u32,
+    /// Frecency bonus added to the match score; one matched char is worth ~16.
     pub bonus: u32,
 }
 
@@ -23,17 +25,25 @@ pub struct Index {
     items: Vec<Item>,
     ids: FxHashMap<String, u32>,
     by_bonus: Vec<u32>,
+    /// The last few distinct items used, most recent first.
+    recent: Vec<u32>,
     generation: u64,
 }
 
+/// Extra bonus for the most recently used items, so a run of transactions
+/// against the same account or payee keeps it at the top.
+const RECENT_BOOST: [u32; 6] = [12, 10, 8, 6, 4, 2];
+
+/// Up to 8 points for frequency plus up to 10 for recency across the whole history.
 fn frecency(usage: &Usage, recency_rank: f64) -> u32 {
     let freq = (usage.count + 1).ilog2().min(4) * 2;
-    freq + (recency_rank * 8.0) as u32
+    freq + (recency_rank * 10.0) as u32
 }
 
 impl Index {
     pub fn build(entries: Vec<(String, Usage)>) -> Index {
         let n = entries.len();
+        let entries_used: Vec<bool> = entries.iter().map(|(_, u)| u.count > 0).collect();
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_unstable_by_key(|&i| entries[i].1.last_seq);
         let mut rank = vec![0.0; n];
@@ -45,14 +55,26 @@ impl Index {
         for (i, (text, usage)) in entries.into_iter().enumerate() {
             index.ids.insert(text.clone(), i as u32);
             let hay = Utf32String::from(text.as_str());
+            let base = frecency(&usage, rank[i]);
             index.items.push(Item {
                 text,
                 hay,
-                bonus: frecency(&usage, rank[i]),
+                base,
+                bonus: base,
             });
         }
+        let used = order.iter().rev().filter(|&&i| entries_used[i]);
+        index.recent = used.take(RECENT_BOOST.len()).map(|&i| i as u32).collect();
+        index.apply_recent_boost();
         index.sort_by_bonus();
         index
+    }
+
+    fn apply_recent_boost(&mut self) {
+        for (pos, &id) in self.recent.iter().enumerate() {
+            let item = &mut self.items[id as usize];
+            item.bonus = item.base + RECENT_BOOST[pos];
+        }
     }
 
     fn sort_by_bonus(&mut self) {
@@ -65,19 +87,34 @@ impl Index {
 
     /// Add or refresh a candidate that was just used, ranking it as most recent.
     pub fn upsert(&mut self, text: &str, usage: &Usage) {
-        let bonus = frecency(usage, 1.0);
-        match self.ids.get(text) {
-            Some(&i) => self.items[i as usize].bonus = bonus,
+        let base = frecency(usage, 1.0);
+        let id = match self.ids.get(text) {
+            Some(&i) => {
+                self.items[i as usize].base = base;
+                i
+            }
             None => {
-                self.ids.insert(text.to_owned(), self.items.len() as u32);
+                let i = self.items.len() as u32;
+                self.ids.insert(text.to_owned(), i);
                 let hay = Utf32String::from(text);
                 self.items.push(Item {
                     text: text.to_owned(),
                     hay,
-                    bonus,
+                    base,
+                    bonus: base,
                 });
+                i
             }
+        };
+        // Items leaving the recent list fall back to their base bonus.
+        for &old in &self.recent {
+            let item = &mut self.items[old as usize];
+            item.bonus = item.base;
         }
+        self.recent.retain(|&r| r != id);
+        self.recent.insert(0, id);
+        self.recent.truncate(RECENT_BOOST.len());
+        self.apply_recent_boost();
         self.sort_by_bonus();
     }
 
@@ -279,6 +316,34 @@ mod tests {
         s.search(&ix, "");
         assert_eq!(s.total, 4);
         assert_eq!(texts(&ix, &s)[0], "income:salary"); // most recent first
+    }
+
+    #[test]
+    fn recent_use_outranks_frequency() {
+        let usage = |count, last_seq| Usage { count, last_seq };
+        let mut ix = Index::build(vec![
+            ("assets:bank:alpha".into(), usage(500, 900)),
+            ("assets:bank:beta".into(), usage(3, 1000)),
+            ("assets:bank:gamma".into(), usage(40, 10)),
+        ]);
+        let mut s = Searcher::new();
+        s.search(&ix, "bank");
+        assert_eq!(
+            texts(&ix, &s),
+            ["assets:bank:beta", "assets:bank:alpha", "assets:bank:gamma"]
+        );
+        // Using an old account in this session puts it on top for the next entry.
+        ix.upsert("assets:bank:gamma", &usage(41, 1001));
+        s.search(&ix, "bank");
+        assert_eq!(texts(&ix, &s)[0], "assets:bank:gamma");
+        s.search(&ix, "");
+        assert_eq!(
+            texts(&ix, &s),
+            ["assets:bank:gamma", "assets:bank:beta", "assets:bank:alpha"]
+        );
+        // A clearly better match still wins over recency.
+        s.search(&ix, "alpha");
+        assert_eq!(texts(&ix, &s), ["assets:bank:alpha"]);
     }
 
     #[test]

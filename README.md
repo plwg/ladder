@@ -49,7 +49,9 @@ The usual editing keys also work: Ctrl-A, Ctrl-E, Ctrl-W, Ctrl-U and Ctrl-K.
 ### Behaviour
 
 - **Ranking** combines match quality with how often and how recently each
-  entry was used.
+  entry was used. The last few distinct entries get an extra boost, so a run of
+  transactions against the same account keeps it at the top. A clearly better
+  match still wins.
 - **Templates**: choosing a past description uses that transaction's accounts
   and amounts as defaults.
 - **Balancing**: later amounts default to whatever balances the transaction. A
@@ -84,6 +86,12 @@ Reproduce with:
 
 ```sh
 cargo run --release --example bench -- my.journal "groc store"
+```
+
+To see how accounts rank for a query:
+
+```sh
+cargo run --release --example top -- my.journal "bank"
 ```
 
 ## Limitations
