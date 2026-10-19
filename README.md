@@ -7,12 +7,7 @@ amount pairs until the transaction balances) and appends the result to your
 journal. The difference is a live dropdown under the prompt that fuzzy-matches
 your past descriptions and accounts on every keystroke.
 
-```
-Date [2026-10-19]: y
-Description: grc
-› Grocery Store   expenses:food:groceries, assets:checking
-  1/1 matches · ↑↓ select · Tab insert · Alt-Enter as typed
-```
+![ladder adding a transaction](docs/screenshot.svg)
 
 ## Install
 
