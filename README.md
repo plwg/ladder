@@ -94,6 +94,13 @@ To see how accounts rank for a query:
 cargo run --release --example top -- my.journal "bank"
 ```
 
+To check the ranking against your own history, replay your last N
+transactions and count the keystrokes each set of ranking weights would need:
+
+```sh
+cargo run --release --example replay -- my.journal 50
+```
+
 ## Limitations
 
 - `include` with wildcards is skipped with a warning.

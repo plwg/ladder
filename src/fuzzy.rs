@@ -28,20 +28,44 @@ pub struct Index {
     /// The last few distinct items used, most recent first.
     recent: Vec<u32>,
     generation: u64,
+    weights: Weights,
 }
 
-/// Extra bonus for the most recently used items, so a run of transactions
-/// against the same account or payee keeps it at the top.
-const RECENT_BOOST: [u32; 6] = [12, 10, 8, 6, 4, 2];
+/// How usage history is turned into a ranking bonus (one matched char is worth ~16).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Weights {
+    /// Points per doubling of the use count, for up to 4 doublings.
+    pub freq_step: u32,
+    /// Points for recency across the whole history (oldest 0, newest this).
+    pub recency: f64,
+    /// Extra points for the last few distinct items used, most recent first, so a
+    /// run of transactions against the same account or payee keeps it at the top.
+    pub recent_boost: Vec<u32>,
+}
 
-/// Up to 8 points for frequency plus up to 10 for recency across the whole history.
-fn frecency(usage: &Usage, recency_rank: f64) -> u32 {
-    let freq = (usage.count + 1).ilog2().min(4) * 2;
-    freq + (recency_rank * 10.0) as u32
+impl Default for Weights {
+    fn default() -> Self {
+        Weights {
+            freq_step: 2,
+            recency: 10.0,
+            recent_boost: vec![12, 10, 8, 6, 4, 2],
+        }
+    }
+}
+
+impl Weights {
+    fn frecency(&self, usage: &Usage, recency_rank: f64) -> u32 {
+        let freq = (usage.count + 1).ilog2().min(4) * self.freq_step;
+        freq + (recency_rank * self.recency) as u32
+    }
 }
 
 impl Index {
     pub fn build(entries: Vec<(String, Usage)>) -> Index {
+        Index::build_with(entries, Weights::default())
+    }
+
+    pub fn build_with(entries: Vec<(String, Usage)>, weights: Weights) -> Index {
         let n = entries.len();
         let entries_used: Vec<bool> = entries.iter().map(|(_, u)| u.count > 0).collect();
         let mut order: Vec<usize> = (0..n).collect();
@@ -50,12 +74,15 @@ impl Index {
         for (r, &i) in order.iter().enumerate() {
             rank[i] = (r + 1) as f64 / n as f64;
         }
-        let mut index = Index::default();
+        let mut index = Index {
+            weights,
+            ..Index::default()
+        };
         index.items.reserve(n);
         for (i, (text, usage)) in entries.into_iter().enumerate() {
             index.ids.insert(text.clone(), i as u32);
             let hay = Utf32String::from(text.as_str());
-            let base = frecency(&usage, rank[i]);
+            let base = index.weights.frecency(&usage, rank[i]);
             index.items.push(Item {
                 text,
                 hay,
@@ -64,7 +91,10 @@ impl Index {
             });
         }
         let used = order.iter().rev().filter(|&&i| entries_used[i]);
-        index.recent = used.take(RECENT_BOOST.len()).map(|&i| i as u32).collect();
+        index.recent = used
+            .take(index.weights.recent_boost.len())
+            .map(|&i| i as u32)
+            .collect();
         index.apply_recent_boost();
         index.sort_by_bonus();
         index
@@ -73,7 +103,7 @@ impl Index {
     fn apply_recent_boost(&mut self) {
         for (pos, &id) in self.recent.iter().enumerate() {
             let item = &mut self.items[id as usize];
-            item.bonus = item.base + RECENT_BOOST[pos];
+            item.bonus = item.base + self.weights.recent_boost[pos];
         }
     }
 
@@ -87,7 +117,7 @@ impl Index {
 
     /// Add or refresh a candidate that was just used, ranking it as most recent.
     pub fn upsert(&mut self, text: &str, usage: &Usage) {
-        let base = frecency(usage, 1.0);
+        let base = self.weights.frecency(usage, 1.0);
         let id = match self.ids.get(text) {
             Some(&i) => {
                 self.items[i as usize].base = base;
@@ -113,7 +143,7 @@ impl Index {
         }
         self.recent.retain(|&r| r != id);
         self.recent.insert(0, id);
-        self.recent.truncate(RECENT_BOOST.len());
+        self.recent.truncate(self.weights.recent_boost.len());
         self.apply_recent_boost();
         self.sort_by_bonus();
     }
@@ -124,6 +154,10 @@ impl Index {
 
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+
+    pub fn id(&self, text: &str) -> Option<u32> {
+        self.ids.get(text).copied()
     }
 
     pub fn get(&self, id: u32) -> &Item {

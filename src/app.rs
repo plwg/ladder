@@ -2,7 +2,7 @@
 
 use crate::amount::{Amount, Mixed, parse_posting_amount};
 use crate::dates::parse_smart_date;
-use crate::fuzzy::Index;
+use crate::fuzzy::{Index, Weights};
 use crate::journal::{Journal, TemplatePosting, strip_wrap};
 use crate::ui::{Answer, Spec, Ui};
 use chrono::NaiveDate;
@@ -22,24 +22,48 @@ pub struct Loaded {
 
 impl Loaded {
     pub fn new(journal: Journal) -> Loaded {
-        let descriptions = Index::build(
+        Loaded::with_weights(journal, Weights::default())
+    }
+
+    pub fn with_weights(journal: Journal, weights: Weights) -> Loaded {
+        let descriptions = Index::build_with(
             journal
                 .descriptions
                 .iter()
                 .map(|d| (d.text.clone(), d.usage.clone()))
                 .collect(),
+            weights.clone(),
         );
-        let accounts = Index::build(
+        let accounts = Index::build_with(
             journal
                 .accounts
                 .iter()
                 .map(|a| (a.name.clone(), a.usage.clone()))
                 .collect(),
+            weights,
         );
         Loaded {
             journal,
             descriptions,
             accounts,
+        }
+    }
+
+    /// Add a just-entered transaction (journal text) so it ranks as most recent.
+    pub fn record(&mut self, txn: &str) {
+        self.journal.record(txn);
+        let added = Journal::parse_str(txn);
+        let Some(desc) = added.descriptions.first().map(|d| d.text.as_str()) else {
+            return;
+        };
+        if let Some(d) = self.journal.description(desc) {
+            self.descriptions.upsert(desc, &d.usage);
+        }
+        for p in added.template(desc) {
+            let name = strip_wrap(&p.account);
+            if let Some(a) = self.journal.account(name) {
+                self.accounts.upsert(name, &a.usage);
+            }
         }
     }
 
@@ -479,18 +503,7 @@ impl<U: Ui> App<U> {
     fn save(&mut self) -> io::Result<()> {
         let txn = self.render_transaction();
         append_transaction(&self.path, &txn)?;
-        let data = self.data.as_mut().expect("loaded");
-        data.journal.record(&txn);
-        let desc = self.draft.description.as_deref().unwrap_or_default();
-        if let Some(d) = data.journal.description(desc) {
-            data.descriptions.upsert(desc, &d.usage);
-        }
-        for p in &self.draft.postings {
-            let name = strip_wrap(&p.account);
-            if let Some(a) = data.journal.account(name) {
-                data.accounts.upsert(name, &a.usage);
-            }
-        }
+        self.data.as_mut().expect("loaded").record(&txn);
         Ok(())
     }
 }

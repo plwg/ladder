@@ -61,7 +61,7 @@ pub struct TemplatePosting {
     pub amount: Option<String>,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct Journal {
     pub descriptions: Vec<Description>,
     desc_ix: FxHashMap<String, u32>,
