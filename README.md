@@ -12,6 +12,12 @@ your past descriptions and accounts on every keystroke.
 ## Install
 
 ```sh
+cargo install --git https://github.com/plwg/ladder
+```
+
+Or from a local checkout:
+
+```sh
 cargo install --path .
 ```
 
