@@ -1,4 +1,5 @@
 use ladder::app::{App, Loaded};
+use ladder::case::Case;
 use ladder::journal::expand_tilde;
 use ladder::ui::{LineUi, TermUi};
 use std::io::{self, IsTerminal};
@@ -15,6 +16,9 @@ until the transaction balances. Optional ANSWERS pre-fill the first prompts.
 
 Options:
   -f, --file FILE   journal to append to (default: $LEDGER_FILE or ~/.hledger.journal)
+      --case CASE   how to show past descriptions that differ only in case, which are
+                    merged: usual (default; the most used spelling), title, lower,
+                    upper, or original (don't merge)
   -h, --help        show this help
   -V, --version     show version
 
@@ -24,6 +28,7 @@ Keys:
   Tab               insert the selected candidate for editing
   Enter             accept selection, else typed text, else the [default]
   Alt-Enter         accept the typed text exactly as typed
+  C-y               save the transaction shown in the preview box
   Esc               clear input; on an empty prompt go back a step (also: < Enter)
   C-d / C-c         quit (the unfinished transaction is discarded)
 ";
@@ -37,6 +42,7 @@ fn default_journal() -> PathBuf {
 
 fn main() -> ExitCode {
     let mut file = None;
+    let mut case = Case::default();
     let mut answers = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -56,16 +62,38 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
-            "--" => answers.extend(args.by_ref()),
-            _ => match a.strip_prefix("--file=") {
-                Some(f) => file = Some(expand_tilde(f)),
-                None => answers.push(a),
+            "--case" => match args.next().map(|c| c.parse()) {
+                Some(Ok(c)) => case = c,
+                Some(Err(e)) => {
+                    eprintln!("ladder: {e}");
+                    return ExitCode::FAILURE;
+                }
+                None => {
+                    eprintln!("ladder: {a} needs an argument");
+                    return ExitCode::FAILURE;
+                }
             },
+            "--" => answers.extend(args.by_ref()),
+            _ => {
+                if let Some(f) = a.strip_prefix("--file=") {
+                    file = Some(expand_tilde(f));
+                } else if let Some(c) = a.strip_prefix("--case=") {
+                    match c.parse() {
+                        Ok(c) => case = c,
+                        Err(e) => {
+                            eprintln!("ladder: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                } else {
+                    answers.push(a);
+                }
+            }
         }
     }
     let path = file.unwrap_or_else(default_journal);
     // Parse the journal and build the search indexes while the user types the date.
-    let loader = Loaded::spawn(path.clone());
+    let loader = Loaded::spawn(path.clone(), case);
     let today = chrono::Local::now().date_naive();
 
     let result = if io::stdin().is_terminal() && io::stdout().is_terminal() {
