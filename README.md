@@ -107,3 +107,7 @@ cargo run --release --example replay -- my.journal 50
 - New descriptions don't borrow a template from a similar past description;
   templates come only from the exact description you pick.
 - Amounts you type are saved as written; only bare numbers are reformatted.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
