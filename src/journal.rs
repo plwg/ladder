@@ -322,9 +322,7 @@ impl Journal {
                 u.last_seq = seq0 + a.usage.last_seq;
             }
         }
-        for (commodity, style) in part.styles.iter() {
-            self.styles.observe(commodity, style);
-        }
+        self.styles.merge(&part.styles);
         self.transactions += part.transactions;
         self.warnings.append(&mut part.warnings);
         self.seq += part.seq;
@@ -343,6 +341,8 @@ impl Journal {
         seen: &mut FxHashSet<PathBuf>,
     ) -> bool {
         let mut in_txn = false;
+        // Inside a `commodity` directive, whose indented lines may hold `format AMOUNT`.
+        let mut in_commodity = false;
         let mut in_comment_block = in_comment;
         let mut offset = base;
         for raw in text.split_inclusive('\n') {
@@ -354,10 +354,16 @@ impl Journal {
                 continue;
             }
             match line.as_bytes().first() {
-                None => in_txn = false,
+                None => (in_txn, in_commodity) = (false, false),
                 Some(b' ' | b'\t') => {
                     if in_txn {
                         self.parse_posting(line);
+                    } else if in_commodity
+                        && let Some(fmt) = line.trim_start().strip_prefix("format")
+                        && let Some((_, commodity, style, _)) =
+                            scan_amount(strip_comment(fmt), None)
+                    {
+                        self.styles.declare(commodity, &style);
                     }
                 }
                 Some(b'0'..=b'9') => {
@@ -372,6 +378,7 @@ impl Journal {
                 }
                 Some(_) => {
                     in_txn = false;
+                    in_commodity = line.starts_with("commodity");
                     let (word, rest) = line.split_once([' ', '\t']).unwrap_or((line, ""));
                     match word {
                         "account" => {
@@ -384,7 +391,7 @@ impl Journal {
                             if let Some((_, commodity, style, _)) =
                                 scan_amount(strip_comment(rest), None)
                             {
-                                self.styles.observe(commodity, &style);
+                                self.styles.declare(commodity, &style);
                             }
                         }
                         "include" => self.include(strip_comment(rest), dir, seen),
@@ -570,6 +577,23 @@ end comment
         assert_eq!(summary(&Journal::parse_str(&text)), summary(&par));
         assert_eq!(par.transactions, 6);
         assert!(par.account("x:y").is_none());
+    }
+
+    #[test]
+    fn declared_style_beats_inferred_precision() {
+        let j = Journal::parse_str(
+            "D S$1,000.00\n\n2026-01-01 open\n    assets:bank  S$-1,234.56789\n    equity\n\n\
+             commodity EUR\n    format 1.000,0 EUR\n\n2026-01-02 x\n    a  1,23456 EUR\n    b\n",
+        );
+        let sgd = j.styles.get("S$").unwrap();
+        assert_eq!((sgd.precision, sgd.thousands), (2, Some(',')));
+        let eur = j.styles.get("EUR").unwrap();
+        assert_eq!((eur.precision, eur.decimal_mark), (1, ','));
+        let amt = crate::amount::Amount {
+            qty: crate::amount::Decimal::new(1234, 2),
+            commodity: "S$".into(),
+        };
+        assert_eq!(j.styles.format(&amt), "S$12.34");
     }
 
     #[test]

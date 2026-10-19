@@ -145,31 +145,46 @@ pub struct Parsed {
     pub style: Style,
 }
 
-/// Commodity styles observed in a journal; precision is the max seen.
+/// Commodity display styles. As in hledger, a style declared by a `commodity` or
+/// `D` directive wins; otherwise it's inferred from amounts, using the max precision seen.
 #[derive(Default, Debug, Clone)]
-pub struct Styles(FxHashMap<String, Style>);
+pub struct Styles(FxHashMap<String, (Style, bool)>);
 
 impl Styles {
+    /// Note a style seen on an amount.
     pub fn observe(&mut self, commodity: &str, style: &Style) {
         match self.0.get_mut(commodity) {
-            Some(s) => {
+            Some((_, true)) => {}
+            Some((s, false)) => {
                 s.precision = s.precision.max(style.precision);
                 if s.thousands.is_none() {
                     s.thousands = style.thousands;
                 }
             }
             None => {
-                self.0.insert(commodity.to_owned(), style.clone());
+                self.0.insert(commodity.to_owned(), (style.clone(), false));
+            }
+        }
+    }
+
+    /// Set a commodity's style from a directive, overriding anything inferred.
+    pub fn declare(&mut self, commodity: &str, style: &Style) {
+        self.0.insert(commodity.to_owned(), (style.clone(), true));
+    }
+
+    /// Fold in styles gathered from another part of the journal.
+    pub fn merge(&mut self, other: &Styles) {
+        for (commodity, (style, declared)) in &other.0 {
+            if *declared {
+                self.declare(commodity, style);
+            } else {
+                self.observe(commodity, style);
             }
         }
     }
 
     pub fn get(&self, commodity: &str) -> Option<&Style> {
-        self.0.get(commodity)
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &Style)> {
-        self.0.iter().map(|(c, s)| (c.as_str(), s))
+        self.0.get(commodity).map(|(s, _)| s)
     }
 
     pub fn format(&self, a: &Amount) -> String {
