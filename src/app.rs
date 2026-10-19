@@ -375,12 +375,14 @@ impl<U: Ui> App<U> {
         let mut pa = match parse_posting_amount(&text, Some(styles)) {
             Ok(pa) => pa,
             Err(e) => {
-                self.p
-                    .retry(format!("{e} (e.g. $12.50, 10 EUR, -3 AAPL @ $150)"), t);
+                self.p.retry(
+                    format!("{e} (e.g. $12.50, 10 EUR, $(20+5)/2, -3 AAPL @ $150)"),
+                    t,
+                );
                 return Ok(answer);
             }
         };
-        let mut text = text;
+        let mut text = pa.evaluated.clone().unwrap_or(text);
         // A bare number takes the commodity of the suggested amount.
         let default_commodity = default
             .as_deref()
@@ -394,8 +396,11 @@ impl<U: Ui> App<U> {
             pa.parsed.amount.commodity = c.clone();
             pa.weight.commodity = c;
             text = styles.format(&pa.parsed.amount);
-        } else {
+        } else if pa.evaluated.is_none() {
             styles.observe(&pa.parsed.amount.commodity, &pa.parsed.style);
+        }
+        if pa.evaluated.is_some() {
+            self.p.say(&format!("  = {text}"))?;
         }
         let account = self.draft.pending_account.take().expect("pending account");
         self.draft.postings.push(Posting {

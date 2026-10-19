@@ -58,6 +58,26 @@ impl Decimal {
         self
     }
 
+    /// Division to 12 fractional digits (rounded); `None` on division by zero or overflow.
+    pub fn checked_div(self, o: Self) -> Option<Self> {
+        const SCALE: u32 = 12;
+        if o.mant == 0 {
+            return None;
+        }
+        // self.mant * 10^(SCALE + o.scale - self.scale + 1) / o.mant gives one guard digit.
+        let exp = (SCALE + o.scale + 1) as i64 - self.scale as i64;
+        let num = if exp >= 0 {
+            self.mant.checked_mul(10i128.checked_pow(exp as u32)?)?
+        } else {
+            self.mant / 10i128.pow((-exp) as u32)
+        };
+        let q = Decimal {
+            mant: num / o.mant,
+            scale: SCALE + 1,
+        };
+        Some(q.round(SCALE).normalize())
+    }
+
     /// Round half away from zero to at most `places` fractional digits.
     pub fn round(self, places: u32) -> Self {
         if self.scale <= places {
@@ -347,12 +367,199 @@ pub struct PostingAmount {
     pub parsed: Parsed,
     /// What this posting contributes to the transaction balance (its cost, if priced).
     pub weight: Amount,
+    /// The amount was arithmetic (`$(12+3)/2`) and has been evaluated; write it this way.
+    pub evaluated: Option<String>,
+}
+
+/// An arithmetic amount: numbers with `+ - * /`, parentheses, unary minus, and a
+/// commodity symbol on either side of any number (all must be the same commodity).
+struct Expr<'a, 's> {
+    s: &'a str,
+    pos: usize,
+    styles: Option<&'s Styles>,
+    commodity: Option<&'a str>,
+    /// Where the first commodity symbol was written: (left of the number, spaced).
+    side: Option<(bool, bool)>,
+    style: Option<Style>,
+    precision: u32,
+    divided: bool,
+}
+
+impl<'a> Expr<'a, '_> {
+    fn rest(&self) -> &'a str {
+        &self.s[self.pos..]
+    }
+
+    fn skip_ws(&mut self) {
+        let r = self.rest();
+        self.pos += r.len() - r.trim_start().len();
+    }
+
+    fn eat(&mut self, c: char) -> bool {
+        self.skip_ws();
+        if self.rest().starts_with(c) {
+            self.pos += c.len_utf8();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Consume a commodity symbol if one is here.
+    fn commodity(&mut self, left: bool) -> Result<bool, String> {
+        let before = self.pos;
+        self.skip_ws();
+        let Some((c, n)) = take_commodity(self.rest()) else {
+            self.pos = before;
+            return Ok(false);
+        };
+        match self.commodity {
+            Some(prev) if prev != c => {
+                return Err(format!("can't mix {prev} and {c} in one amount"));
+            }
+            _ => self.commodity = Some(c),
+        }
+        self.pos += n;
+        let spaced = if left {
+            let r = self.rest();
+            r.len() != r.trim_start().len()
+        } else {
+            self.s[before..].starts_with(char::is_whitespace)
+        };
+        self.side.get_or_insert((left, spaced));
+        Ok(true)
+    }
+
+    fn expr(&mut self) -> Result<Decimal, String> {
+        let mut v = self.term()?;
+        loop {
+            if self.eat('+') {
+                v = v + self.term()?;
+            } else if self.eat('-') {
+                v = v + -self.term()?;
+            } else {
+                return Ok(v);
+            }
+        }
+    }
+
+    fn term(&mut self) -> Result<Decimal, String> {
+        let mut v = self.factor()?;
+        loop {
+            if self.eat('*') {
+                v = v * self.factor()?;
+            } else if self.eat('/') {
+                self.divided = true;
+                v = v.checked_div(self.factor()?).ok_or("division by zero")?;
+            } else {
+                return Ok(v);
+            }
+        }
+    }
+
+    fn factor(&mut self) -> Result<Decimal, String> {
+        if self.eat('-') {
+            return Ok(-self.factor()?);
+        }
+        if self.eat('+') {
+            return self.factor();
+        }
+        let start = self.pos;
+        let left = self.commodity(true)?;
+        if self.eat('(') {
+            let v = self.expr()?;
+            if !self.eat(')') {
+                return Err("missing )".into());
+            }
+            self.commodity(false)?;
+            return Ok(v);
+        }
+        if left && self.eat('-') {
+            return Ok(-self.factor()?);
+        }
+        self.skip_ws();
+        let hint = self
+            .commodity
+            .and_then(|c| self.styles?.get(c))
+            .map(|s| s.decimal_mark);
+        let (num, n) = take_number(self.rest(), hint)
+            .ok_or_else(|| format!("expected a number at {:?}", &self.s[start..]))?;
+        self.pos += n;
+        self.precision = self.precision.max(num.precision);
+        if self.style.is_none() {
+            self.style = Some(Style {
+                precision: 0,
+                decimal_mark: num.decimal_mark.unwrap_or('.'),
+                thousands: num.thousands,
+                ..Style::default()
+            });
+        }
+        if !left {
+            self.commodity(false)?;
+        }
+        Ok(num.qty)
+    }
+}
+
+/// Evaluate an arithmetic amount, if `s` (with no price or assertion) is one.
+fn eval_amount(s: &str, styles: Option<&Styles>) -> Result<Parsed, String> {
+    let mut e = Expr {
+        s,
+        pos: 0,
+        styles,
+        commodity: None,
+        side: None,
+        style: None,
+        precision: 0,
+        divided: false,
+    };
+    let v = e.expr()?;
+    e.skip_ws();
+    if !e.rest().is_empty() {
+        return Err(format!("unexpected {:?} in amount", e.rest()));
+    }
+    let commodity = e.commodity.unwrap_or("").to_owned();
+    let known = styles.and_then(|st| st.get(&commodity));
+    let precision = match known {
+        Some(st) => st.precision.max(e.precision),
+        None if e.divided => e.precision.max(2),
+        None => e.precision,
+    };
+    let mut style = match known {
+        Some(st) => st.clone(),
+        None => {
+            let mut st = e.style.unwrap_or_default();
+            (st.left, st.spaced) = e.side.unwrap_or((false, true));
+            st
+        }
+    };
+    style.precision = precision;
+    let qty = v.round(precision);
+    Ok(Parsed {
+        amount: Amount { qty, commodity },
+        style,
+    })
 }
 
 pub fn parse_posting_amount(s: &str, styles: Option<&Styles>) -> Result<PostingAmount, String> {
-    let (parsed, rest) =
-        parse_amount(s, styles).ok_or_else(|| format!("can't parse amount: {s}"))?;
-    let rest = rest.trim_start();
+    let main_end = s.find(['@', '=']).unwrap_or(s.len());
+    let (main, tail) = s.split_at(main_end);
+    let plain = parse_amount(main, styles).filter(|(_, rest)| rest.trim().is_empty());
+    let (parsed, evaluated) = match plain {
+        Some((parsed, _)) => (parsed, false),
+        None => (
+            eval_amount(main, styles).map_err(|e| format!("can't parse amount {main:?}: {e}"))?,
+            true,
+        ),
+    };
+    let evaluated = evaluated.then(|| {
+        let shown = format_amount(&parsed.amount, &parsed.style);
+        match tail.trim() {
+            "" => shown,
+            t => format!("{shown} {t}"),
+        }
+    });
+    let rest = tail.trim_start();
     let mut weight = parsed.amount.clone();
     let rest = if let Some(r) = rest.strip_prefix('@') {
         let (total, r) = match r.strip_prefix('@') {
@@ -385,7 +592,11 @@ pub fn parse_posting_amount(s: &str, styles: Option<&Styles>) -> Result<PostingA
     if !(rest.is_empty() || rest.starts_with('=')) {
         return Err(format!("unexpected text after amount: {rest}"));
     }
-    Ok(PostingAmount { parsed, weight })
+    Ok(PostingAmount {
+        parsed,
+        weight,
+        evaluated,
+    })
 }
 
 pub fn format_amount(a: &Amount, style: &Style) -> String {
@@ -539,6 +750,36 @@ mod tests {
         );
         assert!(parse_posting_amount("$10 = $100", None).is_ok());
         assert!(parse_posting_amount("$10 junk", None).is_err());
+    }
+
+    #[test]
+    fn arithmetic() {
+        let ev = |s: &str| parse_posting_amount(s, None).unwrap().evaluated;
+        assert_eq!(ev("$12.50 + 3.20").as_deref(), Some("$15.70"));
+        assert_eq!(ev("$(120-20)/3").as_deref(), Some("$33.33"));
+        assert_eq!(ev("-(10 + 5) EUR").as_deref(), Some("-15 EUR"));
+        assert_eq!(ev("10 EUR - 2.5 EUR").as_deref(), Some("7.5 EUR"));
+        assert_eq!(ev("S$-5 * 2").as_deref(), Some("S$-10"));
+        assert_eq!(ev("100/3").as_deref(), Some("33.33"));
+        assert_eq!(ev("2*(3+4) AAPL @ $10").as_deref(), Some("14 AAPL @ $10"));
+        assert_eq!(ev("$10"), None);
+        assert_eq!(ev("-$10.00"), None);
+        let pa = parse_posting_amount("2*(3+4) AAPL @ $10", None).unwrap();
+        assert_eq!(
+            pa.weight,
+            Amount {
+                qty: Decimal::new(140, 0),
+                commodity: "$".into()
+            }
+        );
+        assert!(parse_posting_amount("$10 / 0", None).is_err());
+        assert!(parse_posting_amount("$10 + 5 EUR", None).is_err());
+        assert!(parse_posting_amount("(5 + 3", None).is_err());
+        let mut st = Styles::default();
+        st.declare("S$", &p("S$1,000.00").style);
+        let pa = parse_posting_amount("S$1000/3", Some(&st)).unwrap();
+        assert_eq!(pa.evaluated.as_deref(), Some("S$333.33"));
+        assert_eq!(pa.weight.qty, Decimal::new(33333, 2));
     }
 
     #[test]

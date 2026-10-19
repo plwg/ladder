@@ -55,6 +55,10 @@ The usual editing keys also work: Ctrl-A, Ctrl-E, Ctrl-W, Ctrl-U and Ctrl-K.
 - **Balancing**: later amounts default to whatever balances the transaction. A
   bare number such as `12.5` takes the default's commodity and is written as
   `$12.50`.
+- **Arithmetic**: amounts can be expressions using `+ - * /`, parentheses and
+  unary minus, e.g. `S$(45.80 + 4.20)/3` or `10+2.5`. The result is rounded to
+  the commodity's precision, shown as `= S$16.67`, and written to the journal as
+  a plain amount.
 - **Dates**: `today`, `y`, `tomorrow`, `-3`, `+2`, `19`, `10/19`,
   `2026-10-19` and `20261019`.
 - **Comments**: text after `;` in a description or amount is kept as a comment.
