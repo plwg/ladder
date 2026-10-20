@@ -1,11 +1,13 @@
 //! The `add` conversation: date → description → (account, amount)* → confirm → append.
 
-use crate::amount::{Amount, Mixed, parse_posting_amount};
+use crate::amount::{Amount, Mixed, PostingAmount, Styles, parse_posting_amount};
+use crate::case::Case;
 use crate::dates::parse_smart_date;
 use crate::fuzzy::{Index, Weights};
-use crate::journal::{Journal, TemplatePosting, strip_wrap};
+use crate::journal::{Journal, TemplatePosting, Usage, strip_wrap};
 use crate::ui::{Answer, Spec, Ui};
 use chrono::NaiveDate;
+use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -16,21 +18,62 @@ use unicode_width::UnicodeWidthStr;
 /// Everything derived from the journal; built off the main thread at startup.
 pub struct Loaded {
     pub journal: Journal,
+    /// Past descriptions, one per group of spellings (see [`Case`]).
     pub descriptions: Index,
     pub accounts: Index,
+    case: Case,
+    /// Description groups by [`Case::key`].
+    groups: FxHashMap<String, Group>,
+}
+
+/// The spellings of a description that are shown as one entry.
+#[derive(Default)]
+struct Group {
+    shown: String,
+    /// The spelling used most recently; its transaction is the template.
+    latest: String,
+    /// Combined usage of every spelling.
+    usage: Usage,
+    /// Count and recency of the spelling `shown` comes from.
+    best: (u32, u32),
 }
 
 impl Loaded {
     pub fn new(journal: Journal) -> Loaded {
-        Loaded::with_weights(journal, Weights::default())
+        Loaded::build(journal, Weights::default(), Case::Original)
     }
 
     pub fn with_weights(journal: Journal, weights: Weights) -> Loaded {
+        Loaded::build(journal, weights, Case::Original)
+    }
+
+    pub fn with_case(journal: Journal, case: Case) -> Loaded {
+        Loaded::build(journal, Weights::default(), case)
+    }
+
+    fn build(journal: Journal, weights: Weights, case: Case) -> Loaded {
+        let mut order = Vec::new();
+        let mut groups: FxHashMap<String, Group> = FxHashMap::default();
+        for d in &journal.descriptions {
+            let g = groups.entry(case.key(&d.text)).or_insert_with_key(|k| {
+                order.push(k.clone());
+                Group::default()
+            });
+            if d.usage.last_seq >= g.usage.last_seq {
+                g.latest.clone_from(&d.text);
+                g.usage.last_seq = d.usage.last_seq;
+            }
+            g.usage.count += d.usage.count;
+            let rank = (d.usage.count, d.usage.last_seq);
+            if rank > g.best {
+                g.best = rank;
+                g.shown = case.apply(&d.text);
+            }
+        }
         let descriptions = Index::build_with(
-            journal
-                .descriptions
+            order
                 .iter()
-                .map(|d| (d.text.clone(), d.usage.clone()))
+                .map(|k| (groups[k].shown.clone(), groups[k].usage.clone()))
                 .collect(),
             weights.clone(),
         );
@@ -46,7 +89,18 @@ impl Loaded {
             journal,
             descriptions,
             accounts,
+            case,
+            groups,
         }
+    }
+
+    /// Postings of the most recent transaction with a spelling of `text`.
+    pub fn template(&self, text: &str) -> Vec<TemplatePosting> {
+        let exact = self
+            .groups
+            .get(&self.case.key(text))
+            .map_or(text, |g| g.latest.as_str());
+        self.journal.template(exact)
     }
 
     /// Add a just-entered transaction (journal text) so it ranks as most recent.
@@ -57,7 +111,15 @@ impl Loaded {
             return;
         };
         if let Some(d) = self.journal.description(desc) {
-            self.descriptions.upsert(desc, &d.usage);
+            let case = self.case;
+            let g = self.groups.entry(case.key(desc)).or_insert_with(|| Group {
+                shown: case.apply(desc),
+                ..Group::default()
+            });
+            desc.clone_into(&mut g.latest);
+            g.usage.count += 1;
+            g.usage.last_seq = d.usage.last_seq;
+            self.descriptions.upsert(&g.shown, &g.usage);
         }
         for p in added.template(desc) {
             let name = strip_wrap(&p.account);
@@ -67,11 +129,12 @@ impl Loaded {
         }
     }
 
-    pub fn spawn(path: PathBuf) -> JoinHandle<io::Result<Loaded>> {
-        std::thread::spawn(move || Journal::load(&path).map(Loaded::new))
+    pub fn spawn(path: PathBuf, case: Case) -> JoinHandle<io::Result<Loaded>> {
+        std::thread::spawn(move || Journal::load(&path).map(|j| Loaded::with_case(j, case)))
     }
 }
 
+#[derive(Clone)]
 struct Posting {
     account: String,
     amount: String,
@@ -94,6 +157,15 @@ impl Draft {
     fn is_empty(&self) -> bool {
         self.date.is_none()
     }
+
+    fn render(&self, postings: &[Posting]) -> String {
+        render_transaction(
+            self.date.expect("date"),
+            self.description.as_deref().unwrap_or(""),
+            self.comment.as_deref(),
+            postings,
+        )
+    }
 }
 
 /// Split `text ; comment` into its parts.
@@ -105,6 +177,178 @@ fn split_comment(s: &str) -> (String, Option<String>) {
         ),
         None => (s.trim().to_owned(), None),
     }
+}
+
+/// An amount answer as it will be written: arithmetic evaluated, and a bare number
+/// given the commodity of `default`. Also says whether the bare number was restyled.
+fn resolve_amount(
+    text: &str,
+    default: Option<&str>,
+    styles: &Styles,
+) -> Result<(PostingAmount, String, bool), String> {
+    let mut pa = parse_posting_amount(text, Some(styles))?;
+    let mut written = pa.evaluated.clone().unwrap_or_else(|| text.to_owned());
+    let default_commodity = default
+        .and_then(|d| parse_posting_amount(d, Some(styles)).ok())
+        .map(|d| d.parsed.amount.commodity)
+        .filter(|c| !c.is_empty());
+    let mut restyled = false;
+    if pa.parsed.amount.commodity.is_empty()
+        && pa.weight.commodity.is_empty()
+        && let Some(c) = default_commodity
+    {
+        pa.parsed.amount.commodity = c.clone();
+        pa.weight.commodity = c;
+        written = styles.format(&pa.parsed.amount);
+        restyled = true;
+    }
+    Ok((pa, written, restyled))
+}
+
+fn sum(postings: &[Posting]) -> Mixed {
+    let mut m = Mixed::default();
+    for p in postings {
+        m.add(&p.weight);
+    }
+    m
+}
+
+fn is_balanced(postings: &[Posting], styles: &Styles) -> bool {
+    postings.len() >= 2 && sum(postings).is_balanced(styles)
+}
+
+/// The suggested amount for the next posting: the template's, or what balances.
+fn default_amount(draft: &Draft, styles: &Styles) -> Option<String> {
+    let n = draft.postings.len();
+    let tpl = &draft.template;
+    let tpl_amount = tpl.get(n).and_then(|p| p.amount.clone());
+    let is_last_tpl = n + 1 >= tpl.len();
+    if !is_last_tpl && tpl_amount.is_some() {
+        return tpl_amount;
+    }
+    let balance = sum(&draft.postings);
+    let balancing = balance.nonzero(styles).next().map(|a| {
+        styles.format(&Amount {
+            qty: -a.qty,
+            commodity: a.commodity.clone(),
+        })
+    });
+    balancing.or(tpl_amount)
+}
+
+/// `fixed` followed by postings for `rest` with amounts filled in as far as they can
+/// be without asking: amounts as last written, and a single missing amount takes
+/// whatever balances the rest. Stops at the first posting that needs input.
+fn fill_template(fixed: Vec<Posting>, rest: &[TemplatePosting], styles: &Styles) -> Vec<Posting> {
+    let filled = fill(fixed.clone(), rest, styles, false);
+    if is_balanced(&filled, styles) || rest.iter().any(|t| t.amount.is_none()) {
+        return filled;
+    }
+    // Amounts differ from last time: let the last posting take up the difference.
+    fill(fixed, rest, styles, true)
+}
+
+fn fill(
+    mut out: Vec<Posting>,
+    rest: &[TemplatePosting],
+    styles: &Styles,
+    balance_last: bool,
+) -> Vec<Posting> {
+    let mut given = Vec::new();
+    for (i, t) in rest.iter().enumerate() {
+        let amount = t
+            .amount
+            .as_ref()
+            .filter(|_| !(balance_last && i + 1 == rest.len()));
+        match amount {
+            Some(a) => match parse_posting_amount(a, Some(styles)) {
+                Ok(pa) => given.push((
+                    t,
+                    Some((pa.evaluated.unwrap_or_else(|| a.clone()), pa.weight)),
+                )),
+                Err(_) => break,
+            },
+            None => given.push((t, None)),
+        }
+    }
+    let mut balance = sum(&out);
+    for (_, w) in given.iter().filter_map(|(_, a)| a.as_ref()) {
+        balance.add(w);
+    }
+    let missing = given.iter().filter(|(_, a)| a.is_none()).count();
+    for (t, a) in given {
+        let (amount, weight) = match a {
+            Some(a) => a,
+            None => {
+                let mut nz = balance.nonzero(styles);
+                match (missing, nz.next(), nz.next()) {
+                    (1, Some(b), None) => {
+                        let w = Amount {
+                            qty: -b.qty,
+                            commodity: b.commodity.clone(),
+                        };
+                        (styles.format(&w), w)
+                    }
+                    _ => break,
+                }
+            }
+        };
+        out.push(Posting {
+            account: t.account.clone(),
+            amount,
+            comment: None,
+            weight,
+        });
+    }
+    out
+}
+
+/// The prompt being previewed, with the answer it would get.
+enum Step<'a> {
+    Description,
+    Account(&'a str),
+    Amount(&'a str),
+}
+
+/// The postings the transaction would be saved with if the current prompt got
+/// `step`'s answer and the template supplied the rest, or `None` if it would still
+/// need input.
+fn complete(draft: &Draft, step: Step, styles: &Styles) -> Option<Vec<Posting>> {
+    let n = draft.postings.len();
+    let tail = draft.template.get(n + 1..).unwrap_or_default();
+    let mut fixed = draft.postings.clone();
+    let mut rest = Vec::new();
+    match step {
+        Step::Description => rest = draft.template.clone(),
+        Step::Account(a) => {
+            let a = a.trim();
+            if a.contains("  ") || a.contains('\t') {
+                return None;
+            }
+            if !a.is_empty() && a != "." {
+                rest.push(TemplatePosting {
+                    account: a.to_owned(),
+                    amount: draft.template.get(n).and_then(|t| t.amount.clone()),
+                });
+                rest.extend_from_slice(tail);
+            }
+        }
+        Step::Amount(a) => {
+            let (text, comment) = split_comment(a);
+            let default = default_amount(draft, styles);
+            let (pa, amount, _) = resolve_amount(&text, default.as_deref(), styles).ok()?;
+            fixed.push(Posting {
+                account: draft.pending_account.clone()?,
+                amount,
+                comment,
+                weight: pa.weight,
+            });
+            rest.extend_from_slice(tail);
+        }
+    }
+    let total = fixed.len() + rest.len();
+    let postings = fill_template(fixed, &rest, styles);
+    (postings.len() == total && is_balanced(&postings, styles)).then_some(postings)
 }
 
 /// Prompting plus the per-prompt state that survives between prompts.
@@ -223,7 +467,7 @@ impl<U: Ui> App<U> {
                     return Ok(());
                 }
                 Answer::Back => self.back(),
-                Answer::Text(_) => {}
+                Answer::Text(_) | Answer::Accept(_) => {}
             }
         }
     }
@@ -275,39 +519,54 @@ impl<U: Ui> App<U> {
         let data = self
             .data
             .get_or_insert_with(|| Loaded::new(Journal::default()));
-        let journal = &data.journal;
-        let detail = |text: &str| {
-            let accounts: Vec<String> = journal
-                .template(text)
-                .into_iter()
-                .map(|p| p.account)
-                .collect();
-            accounts.join(", ")
+        let data = &*data;
+        let date = self.draft.date;
+        let preview = |text: &str| {
+            let (desc, comment) = split_comment(text);
+            let draft = Draft {
+                date,
+                template: data.template(&desc),
+                description: Some(desc),
+                comment,
+                ..Draft::default()
+            };
+            let postings = complete(&draft, Step::Description, &data.journal.styles)?;
+            Some(draft.render(&postings))
         };
         let mut spec = Spec::new("Description");
         spec.completion = Some(&data.descriptions);
-        spec.detail = Some(&detail);
+        spec.preview = Some(&preview);
         let answer = self.p.ask(spec)?;
-        if let Answer::Text(t) = &answer {
+        if let Answer::Text(t) | Answer::Accept(t) = &answer {
             let (desc, comment) = split_comment(t);
-            self.draft.template = journal.template(&desc);
+            self.draft.template = data.template(&desc);
             self.draft.description = Some(desc);
             self.draft.comment = comment;
+        }
+        if let Answer::Accept(_) = &answer {
+            self.accept(Step::Description)?;
         }
         Ok(answer)
     }
 
+    /// Ctrl-Y: save the previewed transaction, if it's complete.
+    fn accept(&mut self, step: Step) -> io::Result<()> {
+        let styles = &self.data().journal.styles;
+        let Some(postings) = complete(&self.draft, step, styles) else {
+            return Ok(());
+        };
+        self.draft.postings = postings;
+        self.draft.pending_account = None;
+        self.p.say(&self.render_transaction())?;
+        self.save_draft()
+    }
+
     fn balance(&self) -> Mixed {
-        let mut m = Mixed::default();
-        for p in &self.draft.postings {
-            m.add(&p.weight);
-        }
-        m
+        sum(&self.draft.postings)
     }
 
     fn is_balanced(&self) -> bool {
-        let styles = &self.data().journal.styles;
-        self.draft.postings.len() >= 2 && self.balance().is_balanced(styles)
+        is_balanced(&self.draft.postings, &self.data().journal.styles)
     }
 
     fn ask_account(&mut self) -> io::Result<Answer> {
@@ -315,6 +574,9 @@ impl<U: Ui> App<U> {
         let balanced = self.is_balanced();
         let default = self.draft.template.get(n).map(|p| p.account.clone());
         let data = self.data.as_ref().expect("loaded");
+        let draft = &self.draft;
+        let styles = &data.journal.styles;
+        let preview = |t: &str| complete(draft, Step::Account(t), styles).map(|p| draft.render(&p));
         let label = if balanced {
             format!(
                 "Account {} (Enter{} to finish)",
@@ -327,67 +589,60 @@ impl<U: Ui> App<U> {
         let mut spec = Spec::new(label);
         spec.default = default;
         spec.completion = Some(&data.accounts);
+        spec.preview = Some(&preview);
         let answer = self.p.ask(spec)?;
-        if let Answer::Text(t) = &answer {
-            let t = t.trim();
-            if t.is_empty() || t == "." {
-                if balanced {
-                    self.draft.finished = true;
-                    let txn = self.render_transaction();
-                    self.p.say(&txn)?;
-                } else if n < 2 {
-                    self.p.error = Some("A transaction needs at least two postings.".into());
+        match &answer {
+            Answer::Accept(t) => self.accept(Step::Account(t))?,
+            Answer::Text(t) => {
+                let t = t.trim();
+                if t.is_empty() || t == "." {
+                    if balanced {
+                        self.draft.finished = true;
+                        let txn = self.render_transaction();
+                        self.p.say(&txn)?;
+                    } else if n < 2 {
+                        self.p.error = Some("A transaction needs at least two postings.".into());
+                    } else {
+                        let styles = &self.data().journal.styles;
+                        self.p.error = Some(format!(
+                            "Transaction is unbalanced by {}; add another posting.",
+                            self.balance().display(styles)
+                        ));
+                    }
+                } else if t.contains("  ") || t.contains('\t') {
+                    self.p
+                        .retry("Account names can't contain two spaces or tabs.".into(), t);
                 } else {
-                    let styles = &self.data.as_ref().expect("loaded").journal.styles;
-                    self.p.error = Some(format!(
-                        "Transaction is unbalanced by {}; add another posting.",
-                        self.balance().display(styles)
-                    ));
+                    self.draft.pending_account = Some(t.to_owned());
                 }
-            } else if t.contains("  ") || t.contains('\t') {
-                self.p
-                    .retry("Account names can't contain two spaces or tabs.".into(), t);
-            } else {
-                self.draft.pending_account = Some(t.to_owned());
             }
+            _ => {}
         }
         Ok(answer)
     }
 
-    fn default_amount(&self) -> Option<String> {
-        let n = self.draft.postings.len();
-        let tpl = &self.draft.template;
-        let tpl_amount = tpl.get(n).and_then(|p| p.amount.clone());
-        let is_last_tpl = n + 1 >= tpl.len();
-        if !is_last_tpl && tpl_amount.is_some() {
-            return tpl_amount;
-        }
-        let styles = &self.data().journal.styles;
-        let balance = self.balance();
-        let balancing = balance.nonzero(styles).next().map(|a| {
-            styles.format(&Amount {
-                qty: -a.qty,
-                commodity: a.commodity.clone(),
-            })
-        });
-        balancing.or(tpl_amount)
-    }
-
     fn ask_amount(&mut self) -> io::Result<Answer> {
         let n = self.draft.postings.len();
-        let default = self.default_amount();
+        let data = self.data.as_ref().expect("loaded");
+        let styles = &data.journal.styles;
+        let draft = &self.draft;
+        let default = default_amount(draft, styles);
+        let preview = |t: &str| complete(draft, Step::Amount(t), styles).map(|p| draft.render(&p));
         let mut spec = Spec::new(format!("Amount {}", n + 1));
         spec.default = default.clone();
-        let styles = &self.data.as_ref().expect("loaded").journal.styles;
-        if n > 0 && !self.balance().is_balanced(styles) {
-            spec.hint = Some(format!(
-                "  balance so far: {}",
-                self.balance().display(styles)
-            ));
+        let balance = sum(&draft.postings);
+        if n > 0 && !balance.is_balanced(styles) {
+            spec.hint = Some(format!("  balance so far: {}", balance.display(styles)));
         }
+        spec.preview = Some(&preview);
         let answer = self.p.ask(spec)?;
-        let Answer::Text(t) = &answer else {
-            return Ok(answer);
+        let t = match &answer {
+            Answer::Text(t) => t,
+            Answer::Accept(t) => {
+                self.accept(Step::Amount(t))?;
+                return Ok(answer);
+            }
+            _ => return Ok(answer),
         };
         let (text, comment) = split_comment(t);
         if text.is_empty() {
@@ -396,8 +651,8 @@ impl<U: Ui> App<U> {
             return Ok(answer);
         }
         let styles = &mut self.data.as_mut().expect("loaded").journal.styles;
-        let mut pa = match parse_posting_amount(&text, Some(styles)) {
-            Ok(pa) => pa,
+        let (pa, text, restyled) = match resolve_amount(&text, default.as_deref(), styles) {
+            Ok(r) => r,
             Err(e) => {
                 self.p.retry(
                     format!("{e} (e.g. $12.50, 10 EUR, $(20+5)/2, -3 AAPL @ $150)"),
@@ -406,21 +661,7 @@ impl<U: Ui> App<U> {
                 return Ok(answer);
             }
         };
-        let mut text = pa.evaluated.clone().unwrap_or(text);
-        // A bare number takes the commodity of the suggested amount.
-        let default_commodity = default
-            .as_deref()
-            .and_then(|d| parse_posting_amount(d, Some(styles)).ok())
-            .map(|d| d.parsed.amount.commodity)
-            .filter(|c| !c.is_empty());
-        if pa.parsed.amount.commodity.is_empty()
-            && pa.weight.commodity.is_empty()
-            && let Some(c) = default_commodity
-        {
-            pa.parsed.amount.commodity = c.clone();
-            pa.weight.commodity = c;
-            text = styles.format(&pa.parsed.amount);
-        } else if pa.evaluated.is_none() {
+        if !restyled && pa.evaluated.is_none() {
             styles.observe(&pa.parsed.amount.commodity, &pa.parsed.style);
         }
         if pa.evaluated.is_some() {
@@ -442,13 +683,7 @@ impl<U: Ui> App<U> {
         let answer = self.p.ask(spec)?;
         if let Answer::Text(t) = &answer {
             match t.trim().to_ascii_lowercase().as_str() {
-                "y" | "yes" => {
-                    self.save()?;
-                    self.p
-                        .say(&format!("Saved to {}.\n", self.path.display()))?;
-                    self.last_date = self.draft.date;
-                    self.draft = Draft::default();
-                }
+                "y" | "yes" => self.save_draft()?,
                 "n" | "no" => {
                     self.p.say("Discarded.\n")?;
                     self.draft = Draft::default();
@@ -460,44 +695,16 @@ impl<U: Ui> App<U> {
     }
 
     fn render_transaction(&self) -> String {
-        let d = &self.draft;
-        let mut s = format!(
-            "{} {}",
-            d.date.expect("date"),
-            d.description.as_deref().unwrap_or("")
-        );
-        if let Some(c) = &d.comment {
-            s.push_str(&format!("  ; {c}"));
-        }
-        s.push('\n');
-        let aw = d
-            .postings
-            .iter()
-            .map(|p| p.account.width())
-            .max()
-            .unwrap_or(0);
-        let mw = d
-            .postings
-            .iter()
-            .map(|p| p.amount.width())
-            .max()
-            .unwrap_or(0);
-        for p in &d.postings {
-            let pad_a = aw - p.account.width();
-            let pad_m = mw - p.amount.width();
-            s.push_str(&format!(
-                "    {}{}  {}{}",
-                p.account,
-                " ".repeat(pad_a),
-                " ".repeat(pad_m),
-                p.amount
-            ));
-            if let Some(c) = &p.comment {
-                s.push_str(&format!("  ; {c}"));
-            }
-            s.push('\n');
-        }
-        s
+        self.draft.render(&self.draft.postings)
+    }
+
+    fn save_draft(&mut self) -> io::Result<()> {
+        self.save()?;
+        self.p
+            .say(&format!("Saved to {}.\n", self.path.display()))?;
+        self.last_date = self.draft.date;
+        self.draft = Draft::default();
+        Ok(())
     }
 
     fn save(&mut self) -> io::Result<()> {
@@ -506,6 +713,41 @@ impl<U: Ui> App<U> {
         self.data.as_mut().expect("loaded").record(&txn);
         Ok(())
     }
+}
+
+fn render_transaction(
+    date: NaiveDate,
+    description: &str,
+    comment: Option<&str>,
+    postings: &[Posting],
+) -> String {
+    let mut s = format!("{date} {description}");
+    if let Some(c) = comment {
+        s.push_str(&format!("  ; {c}"));
+    }
+    s.push('\n');
+    let aw = postings
+        .iter()
+        .map(|p| p.account.width())
+        .max()
+        .unwrap_or(0);
+    let mw = postings.iter().map(|p| p.amount.width()).max().unwrap_or(0);
+    for p in postings {
+        let pad_a = aw - p.account.width();
+        let pad_m = mw - p.amount.width();
+        s.push_str(&format!(
+            "    {}{}  {}{}",
+            p.account,
+            " ".repeat(pad_a),
+            " ".repeat(pad_m),
+            p.amount
+        ));
+        if let Some(c) = &p.comment {
+            s.push_str(&format!("  ; {c}"));
+        }
+        s.push('\n');
+    }
+    s
 }
 
 /// Append a transaction, keeping exactly one blank line between entries.
@@ -530,4 +772,231 @@ pub fn append_transaction(path: &Path, txn: &str) -> io::Result<()> {
     }
     f.write_all(format!("{sep}{txn}").as_bytes())?;
     f.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tpl(postings: &[(&str, Option<&str>)]) -> Vec<TemplatePosting> {
+        postings
+            .iter()
+            .map(|&(account, amount)| TemplatePosting {
+                account: account.into(),
+                amount: amount.map(Into::into),
+            })
+            .collect()
+    }
+
+    /// Styles as learned from a journal that writes dollars as `$1.00`.
+    fn dollars() -> Styles {
+        Journal::parse_str("2026-01-01 x\n    a  $1.00\n    b\n").styles
+    }
+
+    fn amounts(postings: &[Posting]) -> Vec<&str> {
+        postings.iter().map(|p| p.amount.as_str()).collect()
+    }
+
+    /// A draft for "Grocer" (last time: food $42.10, checking) with `entered` postings.
+    fn grocer(entered: &[(&str, &str)], pending: Option<&str>) -> Draft {
+        let styles = dollars();
+        Draft {
+            date: NaiveDate::from_ymd_opt(2026, 10, 19),
+            description: Some("Grocer".into()),
+            template: tpl(&[("expenses:food", Some("$42.10")), ("assets:checking", None)]),
+            postings: entered
+                .iter()
+                .map(|&(account, amount)| Posting {
+                    account: account.into(),
+                    amount: amount.into(),
+                    comment: None,
+                    weight: parse_posting_amount(amount, Some(&styles)).unwrap().weight,
+                })
+                .collect(),
+            pending_account: pending.map(Into::into),
+            ..Draft::default()
+        }
+    }
+
+    #[test]
+    fn previews_what_is_typed_for_an_amount() {
+        let styles = dollars();
+        let d = grocer(&[], Some("expenses:food"));
+        let p = complete(&d, Step::Amount("$50 ; snacks"), &styles).unwrap();
+        assert_eq!(amounts(&p), ["$50", "$-50.00"]);
+        assert_eq!(p[0].comment.as_deref(), Some("snacks"));
+        // A bare number takes the default's commodity; arithmetic is evaluated.
+        let p = complete(&d, Step::Amount("10+2.5"), &styles).unwrap();
+        assert_eq!(amounts(&p), ["$12.50", "$-12.50"]);
+        assert!(complete(&d, Step::Amount("$$"), &styles).is_none());
+    }
+
+    #[test]
+    fn previews_a_different_account() {
+        let styles = dollars();
+        let d = grocer(&[], None);
+        let p = complete(&d, Step::Account("expenses:snacks"), &styles).unwrap();
+        assert_eq!(p[0].account, "expenses:snacks");
+        assert_eq!(amounts(&p), ["$42.10", "$-42.10"]);
+        assert!(complete(&d, Step::Account("bad  name"), &styles).is_none());
+    }
+
+    #[test]
+    fn last_posting_absorbs_a_changed_amount() {
+        let styles = dollars();
+        let mut d = grocer(&[("expenses:food", "$50")], None);
+        d.template[1].amount = Some("$-42.10".into());
+        let p = complete(&d, Step::Account("assets:checking"), &styles).unwrap();
+        assert_eq!(amounts(&p), ["$50", "$-50.00"]);
+    }
+
+    #[test]
+    fn finishing_needs_a_balanced_transaction() {
+        let styles = dollars();
+        let open = grocer(&[("expenses:food", "$50")], None);
+        assert!(complete(&open, Step::Account(""), &styles).is_none());
+        let done = grocer(
+            &[("expenses:food", "$50"), ("assets:checking", "$-50")],
+            None,
+        );
+        let p = complete(&done, Step::Account("."), &styles).unwrap();
+        assert_eq!(amounts(&p), ["$50", "$-50"]);
+    }
+
+    const VARIANTS: &str = "\
+2026-01-01 GROCERY STORE
+    expenses:food    $10
+    assets:cash
+
+2026-01-02 grocery store
+    expenses:food    $20
+    assets:checking
+
+2026-01-03 Coffee
+    expenses:coffee    $3
+    assets:cash
+";
+
+    fn shown(data: &Loaded) -> Vec<&str> {
+        let mut v: Vec<&str> = (0..data.descriptions.len() as u32)
+            .map(|i| data.descriptions.get(i).text.as_str())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn merges_descriptions_differing_in_case() {
+        let data = Loaded::with_case(Journal::parse_str(VARIANTS), Case::Title);
+        assert_eq!(shown(&data), ["Coffee", "Grocery Store"]);
+        // The template is the most recent spelling's, whatever case is asked for.
+        let accounts: Vec<String> = data
+            .template("GROCERY store")
+            .into_iter()
+            .map(|p| p.account)
+            .collect();
+        assert_eq!(accounts, ["expenses:food", "assets:checking"]);
+        let original = Loaded::with_case(Journal::parse_str(VARIANTS), Case::Original);
+        assert_eq!(
+            shown(&original),
+            ["Coffee", "GROCERY STORE", "grocery store"]
+        );
+    }
+
+    #[test]
+    fn usual_shows_the_most_used_spelling() {
+        let journal = Journal::parse_str(
+            "2026-01-01 ACME/CO\n    a  $1\n    b\n\n\
+             2026-01-02 ACME/CO\n    a  $1\n    b\n\n\
+             2026-01-03 acme/co\n    a  $2\n    c\n",
+        );
+        let data = Loaded::with_case(journal, Case::Usual);
+        assert_eq!(shown(&data), ["ACME/CO"]);
+        let accounts: Vec<String> = data
+            .template("ACME/CO")
+            .into_iter()
+            .map(|p| p.account)
+            .collect();
+        assert_eq!(accounts, ["a", "c"]);
+        // On a tie the more recent spelling is shown.
+        let tie = Loaded::with_case(Journal::parse_str(VARIANTS), Case::Usual);
+        assert_eq!(shown(&tie), ["Coffee", "grocery store"]);
+    }
+
+    #[test]
+    fn recording_updates_the_merged_entry() {
+        let mut data = Loaded::with_case(Journal::parse_str(VARIANTS), Case::Lower);
+        data.record("2026-01-04 Grocery Store\n    expenses:food    $5\n    assets:card\n");
+        assert_eq!(shown(&data), ["coffee", "grocery store"]);
+        let id = data.descriptions.id("grocery store").unwrap();
+        assert_eq!(data.descriptions.get(id).text, "grocery store");
+        let accounts: Vec<String> = data
+            .template("grocery store")
+            .into_iter()
+            .map(|p| p.account)
+            .collect();
+        assert_eq!(accounts, ["expenses:food", "assets:card"]);
+    }
+
+    #[test]
+    fn fills_the_one_missing_amount() {
+        let styles = dollars();
+        let p = fill_template(
+            Vec::new(),
+            &tpl(&[("expenses:food", Some("$12.50")), ("assets:cash", None)]),
+            &styles,
+        );
+        assert_eq!(amounts(&p), ["$12.50", "$-12.50"]);
+        assert!(is_balanced(&p, &styles));
+    }
+
+    #[test]
+    fn keeps_explicit_amounts() {
+        let styles = dollars();
+        let p = fill_template(
+            Vec::new(),
+            &tpl(&[("expenses:food", Some("$5")), ("assets:cash", Some("-$5"))]),
+            &styles,
+        );
+        assert_eq!(amounts(&p), ["$5", "-$5"]);
+        assert!(is_balanced(&p, &styles));
+    }
+
+    #[test]
+    fn stops_where_input_is_needed() {
+        let styles = dollars();
+        let two_missing = fill_template(
+            Vec::new(),
+            &tpl(&[("a", Some("$5")), ("b", None), ("c", None)]),
+            &styles,
+        );
+        assert_eq!(amounts(&two_missing), ["$5"]);
+        assert!(!is_balanced(&two_missing, &styles));
+        let multi = fill_template(
+            Vec::new(),
+            &tpl(&[
+                ("a", Some("$5")),
+                ("b", Some("3 EUR")),
+                ("c", Some("1 GBP")),
+                ("d", None),
+            ]),
+            &styles,
+        );
+        assert_eq!(amounts(&multi), ["$5", "3 EUR", "1 GBP"]);
+    }
+
+    #[test]
+    fn renders_like_the_journal() {
+        let styles = dollars();
+        let p = fill_template(
+            Vec::new(),
+            &tpl(&[("expenses:food", Some("$5")), ("cash", None)]),
+            &styles,
+        );
+        let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        assert_eq!(
+            render_transaction(date, "Grocer", None, &p),
+            "2026-10-19 Grocer\n    expenses:food      $5\n    cash           $-5.00\n"
+        );
+    }
 }

@@ -11,14 +11,17 @@ use std::io::{self, BufRead, BufWriter, Stdout, Write};
 use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
 
+pub type PreviewFn<'a> = dyn Fn(&str) -> Option<String> + 'a;
+
 pub struct Spec<'a> {
     pub label: String,
     pub default: Option<String>,
     /// Text the input starts with (e.g. the old answer after going back).
     pub initial: String,
     pub completion: Option<&'a Index>,
-    /// Secondary text shown dimmed beside a candidate (computed only for visible rows).
-    pub detail: Option<&'a dyn Fn(&str) -> String>,
+    /// The complete result of the answer Enter would give, shown in a box under the
+    /// prompt; Ctrl-Y accepts it as is. `None` when that answer needs more input.
+    pub preview: Option<&'a PreviewFn<'a>>,
     pub hint: Option<String>,
     pub error: Option<String>,
 }
@@ -30,7 +33,7 @@ impl<'a> Spec<'a> {
             default: None,
             initial: String::new(),
             completion: None,
-            detail: None,
+            preview: None,
             hint: None,
             error: None,
         }
@@ -47,6 +50,8 @@ impl<'a> Spec<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Answer {
     Text(String),
+    /// An answer given with Ctrl-Y: take its preview as is.
+    Accept(String),
     Back,
     Quit,
 }
@@ -128,6 +133,7 @@ impl Drop for TermUi {
 }
 
 const MAX_ROWS: usize = 10;
+const MAX_PREVIEW_ROWS: usize = 8;
 
 struct Editor<'s, 'a> {
     spec: &'s Spec<'a>,
@@ -180,6 +186,22 @@ impl<'s, 'a> Editor<'s, 'a> {
             .map(|&id| index.get(id).text.as_str())
     }
 
+    /// The answer Enter would give, if it's text.
+    fn pending(&self) -> Option<String> {
+        match self.selected.and_then(|i| self.candidate(i)) {
+            Some(c) => Some(c.to_owned()),
+            None => match resolve(self.spec, &self.text()) {
+                Answer::Text(t) => Some(t),
+                _ => None,
+            },
+        }
+    }
+
+    fn preview(&self) -> Option<String> {
+        let f = self.spec.preview?;
+        f(&self.pending()?)
+    }
+
     fn select(&mut self, delta: isize) {
         let n = self.searcher.results.len();
         if n == 0 {
@@ -227,6 +249,10 @@ impl<'s, 'a> Editor<'s, 'a> {
             KeyCode::Enter => match self.selected.and_then(|i| self.candidate(i)) {
                 Some(c) => Outcome::Done(Answer::Text(c.to_owned())),
                 None => Outcome::Done(resolve(self.spec, &self.text())),
+            },
+            KeyCode::Char('y') if ctrl => match self.pending() {
+                Some(t) if self.preview().is_some() => Outcome::Done(Answer::Accept(t)),
+                _ => Outcome::MOVED,
             },
             KeyCode::Char('c') if ctrl => Outcome::Done(Answer::Quit),
             KeyCode::Char('d') if ctrl && self.input.is_empty() => Outcome::Done(Answer::Quit),
@@ -409,8 +435,7 @@ impl<'s, 'a> Editor<'s, 'a> {
                 let hl = self.searcher.highlight(index, id);
                 let selected = self.selected == Some(row);
                 out.queue(Print("\r\n"))?;
-                let detail = self.spec.detail.map(|f| f(&item.text)).unwrap_or_default();
-                render_row(out, &item.text, &detail, &hl, selected, width)?;
+                render_row(out, &item.text, &hl, selected, width)?;
                 lines += 1;
             }
             if self.searcher.total > 0 {
@@ -441,6 +466,9 @@ impl<'s, 'a> Editor<'s, 'a> {
             )?;
             lines += 1;
         }
+        if let Some(p) = self.preview() {
+            lines += render_preview(out, &p, width)?;
+        }
         if lines > 0 {
             out.queue(MoveUp(lines))?;
         }
@@ -459,10 +487,43 @@ fn truncate(s: &str, width: usize) -> String {
         .collect()
 }
 
+/// Draw `text` in a box titled with how to accept it; returns the lines used.
+fn render_preview(out: &mut impl Write, text: &str, width: usize) -> io::Result<u16> {
+    const TITLE: &str = " Ctrl-Y saves this ";
+    let body: Vec<&str> = text.lines().take(MAX_PREVIEW_ROWS).collect();
+    let text_width = |s: &str| s.chars().map(char_width).sum::<usize>();
+    // Inner width: the widest line plus a space either side, within the terminal.
+    let inner = body
+        .iter()
+        .map(|l| text_width(l) + 2)
+        .chain([TITLE.len() + 2])
+        .max()
+        .unwrap_or(0)
+        .min(width.saturating_sub(2));
+    fn dim(out: &mut impl Write, s: &str) -> io::Result<()> {
+        queue!(
+            out,
+            SetForegroundColor(Color::DarkGrey),
+            Print(s),
+            ResetColor
+        )
+    }
+    let fill = inner.saturating_sub(TITLE.len() + 1);
+    dim(out, &format!("\r\n╭─{TITLE}{}╮", "─".repeat(fill)))?;
+    for line in &body {
+        let shown = truncate(line, inner.saturating_sub(2));
+        let pad = " ".repeat(inner.saturating_sub(text_width(&shown) + 1));
+        dim(out, "\r\n│")?;
+        queue!(out, Print(" "), Print(&shown), Print(pad))?;
+        dim(out, "│")?;
+    }
+    dim(out, &format!("\r\n╰{}╯", "─".repeat(inner)))?;
+    Ok(body.len() as u16 + 2)
+}
+
 fn render_row(
     out: &mut impl Write,
     text: &str,
-    detail: &str,
     hl: &[u32],
     selected: bool,
     width: usize,
@@ -497,16 +558,6 @@ fn render_row(
         used += cw;
     }
     queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
-    if !detail.is_empty() && used + 4 < width {
-        let d = truncate(detail, width - used - 3);
-        queue!(
-            out,
-            SetForegroundColor(Color::DarkGrey),
-            Print("   "),
-            Print(d),
-            ResetColor
-        )?;
-    }
     Ok(())
 }
 
@@ -534,7 +585,7 @@ impl Ui for TermUi {
                     match ed.key(k) {
                         Outcome::Done(answer) => {
                             let shown = match &answer {
-                                Answer::Text(t) => t.clone(),
+                                Answer::Text(t) | Answer::Accept(t) => t.clone(),
                                 _ => ed.text(),
                             };
                             queue!(self.out, MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
