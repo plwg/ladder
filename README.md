@@ -7,7 +7,7 @@ amount pairs until the transaction balances) and appends the result to your
 journal. The difference is a live dropdown under the prompt that fuzzy-matches
 your past descriptions and accounts on every keystroke.
 
-![ladder adding a transaction](docs/screenshot.svg)
+![ladder adding a transaction](docs/screenshot.png)
 
 ## Install
 
