@@ -7,7 +7,7 @@ amount pairs until the transaction balances) and appends the result to your
 journal. The difference is a live dropdown under the prompt that fuzzy-matches
 your past descriptions and accounts on every keystroke.
 
-![ladder adding a transaction](docs/screenshot.svg)
+![ladder adding a transaction](docs/screenshot.png)
 
 ## Install
 
@@ -27,6 +27,7 @@ cargo install --path .
 ladder                    # uses $LEDGER_FILE, else ~/.hledger.journal
 ladder -f my.journal
 ladder -f my.journal 2026-10-19 "Grocery Store"   # pre-fill the first answers
+ladder --case title       # show past descriptions in Title Case (see below)
 ```
 
 If stdin isn't a terminal, ladder falls back to plain line-by-line prompts,
@@ -41,6 +42,7 @@ so it can be scripted.
 | Tab | copy the selected match into the prompt for editing |
 | Enter | accept the selection, else your typed text, else the `[default]` |
 | Alt-Enter | accept exactly what you typed (use this for a new description) |
+| Ctrl-Y | save the transaction shown in the preview box |
 | Esc | clear the input; on an empty prompt, go back a step (or type `<`) |
 | `.` | finish the transaction when it already balances |
 | Ctrl-D / Ctrl-C | quit (an unfinished transaction is discarded) |
@@ -53,8 +55,21 @@ The usual editing keys also work: Ctrl-A, Ctrl-E, Ctrl-W, Ctrl-U and Ctrl-K.
   entry was used. The last few distinct entries get an extra boost, so a run of
   transactions against the same account keeps it at the top. A clearly better
   match still wins.
+- **Description case**: spellings of a past description that differ only in
+  case (`GROCERY STORE`, `Grocery Store`, `grocery store`) appear once, ranked by their combined use, and
+  shown in the spelling you've used most. Choosing one saves it as shown and
+  uses the most recent spelling's transaction as the template. `--case title`,
+  `--case lower` or `--case upper` show every description in that case instead,
+  and `--case original` shows each spelling separately.
 - **Templates**: choosing a past description uses that transaction's accounts
   and amounts as defaults.
+- **Preview**: a box under the prompt shows the transaction that would be
+  saved: what you've entered so far, the answer Enter would give right now
+  (the selected match, what you've typed, or the default), and the template's
+  remaining postings, with the last amount balancing. It updates as you type,
+  and Ctrl-Y saves it straight away, skipping the remaining prompts. The box is
+  hidden when the transaction would still need input, e.g. two postings
+  without an amount.
 - **Balancing**: later amounts default to whatever balances the transaction. A
   bare number such as `12.5` takes the default's commodity and is written as
   `$12.50`.
