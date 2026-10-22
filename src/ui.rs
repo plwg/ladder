@@ -213,11 +213,31 @@ impl<'s, 'a> Editor<'s, 'a> {
             (Some(i), d) if d < 0 && i < d.unsigned_abs() => None,
             (Some(i), d) => Some((i as isize + d).clamp(0, n as isize - 1) as usize),
         };
+        self.scroll_to_selected();
+    }
+
+    /// How many match rows fit: everything else drawn below the prompt keeps
+    /// its place, so the list shrinks first on a short terminal.
+    fn visible_rows(&self) -> usize {
+        let (_, h) = terminal::size().unwrap_or((80, 24));
+        let mut fixed = 1; // the prompt
+        fixed += usize::from(self.spec.error.is_some());
+        fixed += usize::from(self.spec.hint.is_some());
+        fixed += usize::from(self.spec.completion.is_some()); // status line
+        if let Some(p) = self.preview() {
+            // A blank line, the box's two edges and its body.
+            fixed += 3 + p.lines().take(MAX_PREVIEW_ROWS).count();
+        }
+        (h as usize).saturating_sub(fixed).clamp(1, MAX_ROWS)
+    }
+
+    fn scroll_to_selected(&mut self) {
+        let rows = self.visible_rows();
         if let Some(i) = self.selected {
             if i < self.scroll {
                 self.scroll = i;
-            } else if i >= self.scroll + MAX_ROWS {
-                self.scroll = i + 1 - MAX_ROWS;
+            } else if i >= self.scroll + rows {
+                self.scroll = i + 1 - rows;
             }
         }
     }
@@ -286,11 +306,11 @@ impl<'s, 'a> Editor<'s, 'a> {
                 Outcome::MOVED
             }
             KeyCode::PageDown => {
-                self.select(MAX_ROWS as isize);
+                self.select(self.visible_rows() as isize);
                 Outcome::MOVED
             }
             KeyCode::PageUp => {
-                self.select(-(MAX_ROWS as isize));
+                self.select(-(self.visible_rows() as isize));
                 Outcome::MOVED
             }
             KeyCode::Left => {
@@ -383,6 +403,7 @@ impl<'s, 'a> Editor<'s, 'a> {
     fn render(&mut self, out: &mut impl Write) -> io::Result<()> {
         let (w, _) = terminal::size().unwrap_or((80, 24));
         let width = (w as usize).max(20) - 1;
+        self.scroll_to_selected();
         let prompt = self.spec.prompt();
         let pw: usize = prompt.chars().map(char_width).sum();
         queue!(out, MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
@@ -428,7 +449,7 @@ impl<'s, 'a> Editor<'s, 'a> {
             lines += 1;
         }
         if let Some(index) = self.spec.completion {
-            let end = (self.scroll + MAX_ROWS).min(self.searcher.results.len());
+            let end = (self.scroll + self.visible_rows()).min(self.searcher.results.len());
             for row in self.scroll..end {
                 let id = self.searcher.results[row];
                 let item = index.get(id);
@@ -466,7 +487,12 @@ impl<'s, 'a> Editor<'s, 'a> {
             )?;
             lines += 1;
         }
+        // A blank line keeps the box apart from the completions and hint.
         if let Some(p) = self.preview() {
+            if lines > 0 {
+                out.queue(Print("\r\n"))?;
+                lines += 1;
+            }
             lines += render_preview(out, &p, width)?;
         }
         if lines > 0 {
@@ -487,7 +513,7 @@ fn truncate(s: &str, width: usize) -> String {
         .collect()
 }
 
-/// Draw `text` in a box titled with how to accept it; returns the lines used.
+/// Draw `text` in a box whose bottom edge is titled with how to accept it; returns the lines used.
 fn render_preview(out: &mut impl Write, text: &str, width: usize) -> io::Result<u16> {
     const TITLE: &str = " Ctrl-Y saves this ";
     let body: Vec<&str> = text.lines().take(MAX_PREVIEW_ROWS).collect();
@@ -508,8 +534,7 @@ fn render_preview(out: &mut impl Write, text: &str, width: usize) -> io::Result<
             ResetColor
         )
     }
-    let fill = inner.saturating_sub(TITLE.len() + 1);
-    dim(out, &format!("\r\n╭─{TITLE}{}╮", "─".repeat(fill)))?;
+    dim(out, &format!("\r\n╭{}╮", "─".repeat(inner)))?;
     for line in &body {
         let shown = truncate(line, inner.saturating_sub(2));
         let pad = " ".repeat(inner.saturating_sub(text_width(&shown) + 1));
@@ -517,7 +542,8 @@ fn render_preview(out: &mut impl Write, text: &str, width: usize) -> io::Result<
         queue!(out, Print(" "), Print(&shown), Print(pad))?;
         dim(out, "│")?;
     }
-    dim(out, &format!("\r\n╰{}╯", "─".repeat(inner)))?;
+    let fill = inner.saturating_sub(TITLE.len() + 1);
+    dim(out, &format!("\r\n╰─{TITLE}{}╯", "─".repeat(fill)))?;
     Ok(body.len() as u16 + 2)
 }
 
