@@ -64,7 +64,8 @@ The usual editing keys also work: Ctrl-A, Ctrl-E, Ctrl-W, Ctrl-U and Ctrl-K.
   and `--case original` shows each spelling separately.
 - **Templates**: choosing a past description uses that transaction's accounts
   and amounts as defaults.
-- **Preview**: a box below the matches shows the transaction that would be
+- **Preview**: a box below the matches (it keeps its place as the list
+  narrows) shows the transaction that would be
   saved: what you've entered so far, the answer Enter would give right now
   (the selected match, what you've typed, or the default), and the template's
   remaining postings, with the last amount balancing. It updates as you type,
