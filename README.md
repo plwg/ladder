@@ -28,6 +28,7 @@ ladder                    # uses $LEDGER_FILE, else ~/.hledger.journal
 ladder -f my.journal
 ladder -f my.journal 2026-10-19 "Grocery Store"   # pre-fill the first answers
 ladder --case title       # show past descriptions in Title Case (see below)
+ladder --status cleared   # mark added transactions cleared (*) or pending (!)
 ```
 
 If stdin isn't a terminal, ladder falls back to plain line-by-line prompts,
