@@ -1,0 +1,32 @@
+name: Version
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check Cargo.toml version was bumped
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          read_version() { sed -n 's/^version = "\(.*\)"/\1/p' | head -n1; }
+          base=$(git show "$BASE_SHA:Cargo.toml" | read_version)
+          head=$(read_version < Cargo.toml)
+          echo "base: $base, head: $head"
+          if [ "$base" = "$head" ]; then
+            echo "Cargo.toml version $head is unchanged; bump it before merging to master" >&2
+            exit 1
+          fi
+          if [ "$(printf '%s\n%s\n' "$base" "$head" | sort -V | tail -n1)" != "$head" ]; then
+            echo "Cargo.toml version $head is lower than master's $base" >&2
+            exit 1
+          fi
