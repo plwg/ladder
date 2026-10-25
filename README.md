@@ -63,7 +63,15 @@ The usual editing keys also work: Ctrl-A, Ctrl-E, Ctrl-W, Ctrl-U and Ctrl-K.
   `--case lower` or `--case upper` show every description in that case instead,
   and `--case original` shows each spelling separately.
 - **Templates**: choosing a past description uses that transaction's accounts
-  and amounts as defaults.
+  and amounts as defaults. A new description borrows the accounts (not the
+  amounts) of the past description sharing most of its distinctive words, e.g.
+  `Blue Bottle Roasters` takes `Blue Bottle Coffee`'s as the account
+  defaults. Common words count for little, so `Main Street Store` borrows
+  nothing.
+- **Account context**: accounts that usually appear with the ones already in
+  the transaction rank higher, so after `expenses:coffee` the card you pay for
+  coffee with comes first. When there's no template account and one is likely
+  enough, it becomes the prompt's default, so Enter or Ctrl-Y takes it.
 - **Preview**: a box below the matches (it keeps its place as the list
   narrows) shows the transaction that would be
   saved: what you've entered so far, the answer Enter would give right now
@@ -113,7 +121,8 @@ cargo run --release --example top -- my.journal "bank"
 ```
 
 To check the ranking against your own history, replay your last N
-transactions and count the keystrokes each set of ranking weights would need:
+transactions and count the keystrokes each set of ranking weights would need,
+and how many the account context and borrowed templates save:
 
 ```sh
 cargo run --release --example replay -- my.journal 50
@@ -122,8 +131,8 @@ cargo run --release --example replay -- my.journal 50
 ## Limitations
 
 - `include` with wildcards is skipped with a warning.
-- New descriptions don't borrow a template from a similar past description;
-  templates come only from the exact description you pick.
+- Borrowing a template matches words, not meaning: a new payee that shares no
+  distinctive word with a past one borrows nothing.
 - Amounts you type are saved as written; only bare numbers are reformatted.
 
 ## License

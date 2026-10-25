@@ -52,6 +52,10 @@ pub struct Description {
 pub struct Account {
     pub name: String,
     pub usage: Usage,
+    /// Transactions it appears in.
+    txns: u32,
+    /// Other accounts in those transactions, by id, with how many they shared.
+    partners: FxHashMap<u32, u32>,
 }
 
 /// A posting of a previous transaction, as written.
@@ -73,6 +77,8 @@ pub struct Journal {
     /// Text of every file read (and of transactions added this session).
     sources: Vec<String>,
     seq: u32,
+    /// Accounts of the transaction being parsed.
+    txn_accounts: Vec<u32>,
 }
 
 /// Split a posting/directive body at the first double space or tab.
@@ -202,6 +208,17 @@ impl Journal {
             .collect()
     }
 
+    /// Accounts that appeared in transactions with `name`, with how many they shared,
+    /// and how many transactions `name` appeared in.
+    pub fn partners(&self, name: &str) -> Option<(u32, impl Iterator<Item = (&str, u32)> + '_)> {
+        let a = self.account(name)?;
+        let names = a
+            .partners
+            .iter()
+            .map(|(&b, &n)| (self.accounts[b as usize].name.as_str(), n));
+        Some((a.txns, names))
+    }
+
     fn account_id(&mut self, name: &str) -> u32 {
         if let Some(&i) = self.acct_ix.get(name) {
             return i;
@@ -210,6 +227,8 @@ impl Journal {
         self.accounts.push(Account {
             name: name.to_owned(),
             usage: Usage::default(),
+            txns: 0,
+            partners: FxHashMap::default(),
         });
         self.acct_ix.insert(name.to_owned(), i);
         i
@@ -314,12 +333,20 @@ impl Journal {
             e.usage.last_seq = seq0 + d.usage.last_seq;
             e.last = remap(d.last);
         }
-        for a in part.accounts.drain(..) {
-            let id = self.account_id(&a.name);
-            let u = &mut self.accounts[id as usize].usage;
-            u.count += a.usage.count;
+        let ids: Vec<u32> = part
+            .accounts
+            .iter()
+            .map(|a| self.account_id(&a.name))
+            .collect();
+        for (a, &id) in part.accounts.drain(..).zip(&ids) {
+            let e = &mut self.accounts[id as usize];
+            e.usage.count += a.usage.count;
             if a.usage.count > 0 {
-                u.last_seq = seq0 + a.usage.last_seq;
+                e.usage.last_seq = seq0 + a.usage.last_seq;
+            }
+            e.txns += a.txns;
+            for (b, n) in a.partners {
+                *e.partners.entry(ids[b as usize]).or_default() += n;
             }
         }
         self.styles.merge(&part.styles);
@@ -431,6 +458,7 @@ impl Journal {
     fn parse_header(&mut self, line: &str, loc: Loc) {
         self.seq += 1;
         self.transactions += 1;
+        self.txn_accounts.clear();
         let mut rest = line
             .split_once([' ', '\t'])
             .map_or("", |(_, r)| r)
@@ -458,6 +486,14 @@ impl Journal {
         }
         let a = self.account_id(strip_wrap(account));
         self.accounts[a as usize].usage.bump(self.seq);
+        if !self.txn_accounts.contains(&a) {
+            for &b in &self.txn_accounts {
+                *self.accounts[a as usize].partners.entry(b).or_default() += 1;
+                *self.accounts[b as usize].partners.entry(a).or_default() += 1;
+            }
+            self.accounts[a as usize].txns += 1;
+            self.txn_accounts.push(a);
+        }
     }
 }
 
@@ -522,6 +558,18 @@ end comment
         assert_eq!(j.account("budget:rent").unwrap().usage.count, 1);
         assert_eq!(j.account("assets:checking").unwrap().usage.count, 2);
         assert!(j.account("a").is_none());
+        let (txns, partners) = j.partners("assets:checking").unwrap();
+        let mut partners: Vec<_> = partners.collect();
+        partners.sort();
+        assert_eq!(txns, 2);
+        assert_eq!(
+            partners,
+            [
+                ("budget:rent", 1),
+                ("expenses:food:groceries", 1),
+                ("expenses:rent", 1)
+            ]
+        );
         let st = j.styles.get("$").unwrap();
         assert_eq!((st.precision, st.thousands, st.left), (2, Some(','), true));
     }
@@ -557,7 +605,18 @@ end comment
             let mut a: Vec<_> = j
                 .accounts
                 .iter()
-                .map(|a| (a.name.clone(), a.usage.count, a.usage.last_seq))
+                .map(|a| {
+                    let (txns, partners) = j.partners(&a.name).unwrap();
+                    let mut partners: Vec<_> = partners.map(|(b, n)| (b.to_owned(), n)).collect();
+                    partners.sort();
+                    (
+                        a.name.clone(),
+                        a.usage.count,
+                        a.usage.last_seq,
+                        txns,
+                        partners,
+                    )
+                })
                 .collect();
             d.sort_by(|x, y| x.0.cmp(&y.0));
             a.sort();
