@@ -278,9 +278,8 @@ struct Draft {
     description: Option<String>,
     comment: Option<String>,
     template: Vec<TemplatePosting>,
-    /// The past description `template`'s accounts were borrowed from, if they were.
-    template_source: Option<String>,
-    /// An amount of that description's, whose commodity a bare number takes.
+    /// An amount of the description `template` was borrowed from, if it was, whose
+    /// commodity a bare number takes.
     sample_amount: Option<String>,
     postings: Vec<Posting>,
     pending_account: Option<String>,
@@ -291,12 +290,6 @@ struct Draft {
 impl Draft {
     fn is_empty(&self) -> bool {
         self.date.is_none()
-    }
-
-    /// Where a borrowed template came from, for a prompt's hint line.
-    fn source_hint(&self) -> Option<String> {
-        let s = self.template_source.as_ref()?;
-        Some(format!("  accounts from: {s}"))
     }
 
     fn render(&self, postings: &[Posting]) -> String {
@@ -645,7 +638,6 @@ impl<U: Ui> App<U> {
             };
         } else if let Some(desc) = d.description.take() {
             d.template.clear();
-            d.template_source = None;
             d.sample_amount = None;
             self.p.prefill = match d.comment.take() {
                 Some(c) => format!("{desc} ; {c}"),
@@ -703,13 +695,11 @@ impl<U: Ui> App<U> {
         if let Answer::Text(t) | Answer::Accept(t) = &answer {
             let (desc, comment) = split_comment(t);
             self.draft.template = data.template(&desc);
-            self.draft.template_source = None;
             self.draft.sample_amount = None;
             if self.draft.template.is_empty()
                 && let Some(b) = data.borrow(&desc)
             {
                 self.draft.template = b.postings;
-                self.draft.template_source = Some(b.source);
                 self.draft.sample_amount = b.sample;
             }
             self.draft.description = Some(desc);
@@ -772,7 +762,6 @@ impl<U: Ui> App<U> {
         spec.default = default;
         spec.completion = Some(&data.accounts);
         spec.boost = Some(&boost);
-        spec.hint = draft.source_hint();
         spec.preview = Some(&preview);
         let answer = self.p.ask(spec)?;
         match &answer {
@@ -817,12 +806,6 @@ impl<U: Ui> App<U> {
         let balance = sum(&draft.postings);
         if n > 0 && !balance.is_balanced(styles) {
             spec.hint = Some(format!("  balance so far: {}", balance.display(styles)));
-        }
-        if let Some(h) = draft.source_hint() {
-            spec.hint = Some(match spec.hint {
-                Some(balance) => format!("{balance}  ·{h}"),
-                None => h,
-            });
         }
         spec.preview = Some(&preview);
         let answer = self.p.ask(spec)?;

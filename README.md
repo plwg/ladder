@@ -65,9 +65,9 @@ The usual editing keys also work: Ctrl-A, Ctrl-E, Ctrl-W, Ctrl-U and Ctrl-K.
 - **Templates**: choosing a past description uses that transaction's accounts
   and amounts as defaults. A new description borrows the accounts (not the
   amounts) of the past description sharing most of its distinctive words, e.g.
-  `Blue Bottle Roasters` takes `Blue Bottle Coffee`'s; the prompts then show
-  `accounts from: Blue Bottle Coffee`. Common words count for little, so
-  `Main Street Store` borrows nothing.
+  `Blue Bottle Roasters` takes `Blue Bottle Coffee`'s as the account
+  defaults. Common words count for little, so `Main Street Store` borrows
+  nothing.
 - **Account context**: accounts that usually appear with the ones already in
   the transaction rank higher, so after `expenses:coffee` the card you pay for
   coffee with comes first. When there's no template account and one is likely
