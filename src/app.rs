@@ -5,6 +5,7 @@ use crate::case::Case;
 use crate::dates::parse_smart_date;
 use crate::fuzzy::{Boost, Index, Weights};
 use crate::journal::{Journal, TemplatePosting, Usage, strip_wrap};
+use crate::status::Status;
 use crate::ui::{Answer, Spec, Ui};
 use chrono::NaiveDate;
 use rustc_hash::FxHashMap;
@@ -284,6 +285,7 @@ struct Draft {
     postings: Vec<Posting>,
     pending_account: Option<String>,
     finished: bool,
+    status: Status,
 }
 
 impl Draft {
@@ -300,6 +302,7 @@ impl Draft {
     fn render(&self, postings: &[Posting]) -> String {
         render_transaction(
             self.date.expect("date"),
+            self.status,
             self.description.as_deref().unwrap_or(""),
             self.comment.as_deref(),
             postings,
@@ -536,6 +539,7 @@ pub struct App<U: Ui> {
     today: NaiveDate,
     last_date: Option<NaiveDate>,
     draft: Draft,
+    status: Status,
 }
 
 impl<U: Ui> App<U> {
@@ -559,6 +563,21 @@ impl<U: Ui> App<U> {
             today,
             last_date: None,
             draft: Draft::default(),
+            status: Status::default(),
+        }
+    }
+
+    /// The status mark (`!` or `*`) to write on every added transaction.
+    pub fn status(mut self, status: Status) -> Self {
+        self.status = status;
+        self.draft = self.new_draft();
+        self
+    }
+
+    fn new_draft(&self) -> Draft {
+        Draft {
+            status: self.status,
+            ..Draft::default()
         }
     }
 
@@ -663,6 +682,7 @@ impl<U: Ui> App<U> {
             .get_or_insert_with(|| Loaded::new(Journal::default()));
         let data = &*data;
         let date = self.draft.date;
+        let status = self.draft.status;
         let preview = |text: &str| {
             let (desc, comment) = split_comment(text);
             let draft = Draft {
@@ -670,6 +690,7 @@ impl<U: Ui> App<U> {
                 template: data.template(&desc),
                 description: Some(desc),
                 comment,
+                status,
                 ..Draft::default()
             };
             let postings = complete(&draft, Step::Description, &data.journal.styles)?;
@@ -856,7 +877,7 @@ impl<U: Ui> App<U> {
                 "y" | "yes" => self.save_draft()?,
                 "n" | "no" => {
                     self.p.say("Discarded.\n")?;
-                    self.draft = Draft::default();
+                    self.draft = self.new_draft();
                 }
                 _ => self.p.error = Some("Please answer y or n (or < to go back).".into()),
             }
@@ -873,7 +894,7 @@ impl<U: Ui> App<U> {
         self.p
             .say(&format!("Saved to {}.\n", self.path.display()))?;
         self.last_date = self.draft.date;
-        self.draft = Draft::default();
+        self.draft = self.new_draft();
         Ok(())
     }
 
@@ -887,11 +908,12 @@ impl<U: Ui> App<U> {
 
 fn render_transaction(
     date: NaiveDate,
+    status: Status,
     description: &str,
     comment: Option<&str>,
     postings: &[Posting],
 ) -> String {
-    let mut s = format!("{date} {description}");
+    let mut s = format!("{date} {}{description}", status.mark());
     if let Some(c) = comment {
         s.push_str(&format!("  ; {c}"));
     }
@@ -1249,8 +1271,12 @@ mod tests {
         );
         let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
         assert_eq!(
-            render_transaction(date, "Grocer", None, &p),
+            render_transaction(date, Status::Unmarked, "Grocer", None, &p),
             "2026-10-19 Grocer\n    expenses:food      $5\n    cash           $-5.00\n"
+        );
+        assert_eq!(
+            render_transaction(date, Status::Cleared, "Grocer", Some("weekly"), &p),
+            "2026-10-19 * Grocer  ; weekly\n    expenses:food      $5\n    cash           $-5.00\n"
         );
     }
 }

@@ -28,6 +28,7 @@ ladder                    # uses $LEDGER_FILE, else ~/.hledger.journal
 ladder -f my.journal
 ladder -f my.journal 2026-10-19 "Grocery Store"   # pre-fill the first answers
 ladder --case title       # show past descriptions in Title Case (see below)
+ladder --status cleared   # mark added transactions cleared (*) or pending (!)
 ```
 
 If stdin isn't a terminal, ladder falls back to plain line-by-line prompts,
@@ -71,7 +72,8 @@ The usual editing keys also work: Ctrl-A, Ctrl-E, Ctrl-W, Ctrl-U and Ctrl-K.
   the transaction rank higher, so after `expenses:coffee` the card you pay for
   coffee with comes first. When there's no template account and one is likely
   enough, it becomes the prompt's default, so Enter or Ctrl-Y takes it.
-- **Preview**: a box below the matches shows the transaction that would be
+- **Preview**: a box below the matches (it keeps its place as the list
+  narrows) shows the transaction that would be
   saved: what you've entered so far, the answer Enter would give right now
   (the selected match, what you've typed, or the default), and the template's
   remaining postings, with the last amount balancing. It updates as you type,

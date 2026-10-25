@@ -452,33 +452,34 @@ impl<'s, 'a> Editor<'s, 'a> {
             lines += 1;
         }
         if let Some(index) = self.spec.completion {
-            let end = (self.scroll + self.visible_rows()).min(self.searcher.results.len());
-            for row in self.scroll..end {
-                let id = self.searcher.results[row];
-                let item = index.get(id);
-                let hl = self.searcher.highlight(index, id);
-                let selected = self.selected == Some(row);
+            // The list always takes all its rows, so the status line and the box
+            // below it stay put however many matches there are.
+            let rows = self.visible_rows();
+            for row in self.scroll..self.scroll + rows {
                 out.queue(Print("\r\n"))?;
-                render_row(out, &item.text, &hl, selected, width)?;
+                if let Some(&id) = self.searcher.results.get(row) {
+                    let item = index.get(id);
+                    let hl = self.searcher.highlight(index, id);
+                    let selected = self.selected == Some(row);
+                    render_row(out, &item.text, &hl, selected, width)?;
+                }
                 lines += 1;
             }
-            if self.searcher.total > 0 {
-                let pos = self
-                    .selected
-                    .map_or(String::new(), |i| format!("{}/", i + 1));
-                let status = format!(
-                    "  {pos}{} matches · ↑↓ select · Tab insert · Alt-Enter as typed",
-                    self.searcher.total
-                );
-                queue!(
-                    out,
-                    Print("\r\n"),
-                    SetForegroundColor(Color::DarkGrey),
-                    Print(truncate(&status, width)),
-                    ResetColor
-                )?;
-                lines += 1;
-            }
+            let pos = self
+                .selected
+                .map_or(String::new(), |i| format!("{}/", i + 1));
+            let status = format!(
+                "  {pos}{} matches · ↑↓ select · Tab insert · Alt-Enter as typed",
+                self.searcher.total
+            );
+            queue!(
+                out,
+                Print("\r\n"),
+                SetForegroundColor(Color::DarkGrey),
+                Print(truncate(&status, width)),
+                ResetColor
+            )?;
+            lines += 1;
         }
         if let Some(h) = &self.spec.hint {
             queue!(

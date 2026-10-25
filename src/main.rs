@@ -1,6 +1,7 @@
 use ladder::app::{App, Loaded};
 use ladder::case::Case;
 use ladder::journal::expand_tilde;
+use ladder::status::Status;
 use ladder::ui::{LineUi, TermUi};
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
@@ -19,6 +20,8 @@ Options:
       --case CASE   how to show past descriptions that differ only in case, which are
                     merged: usual (default; the most used spelling), title, lower,
                     upper, or original (don't merge)
+      --status S    status to mark added transactions with: unmarked (default),
+                    pending (!) or cleared (*)
   -h, --help        show this help
   -V, --version     show version
 
@@ -43,6 +46,7 @@ fn default_journal() -> PathBuf {
 fn main() -> ExitCode {
     let mut file = None;
     let mut case = Case::default();
+    let mut status = Status::default();
     let mut answers = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -73,6 +77,17 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
+            "--status" => match args.next().map(|s| s.parse()) {
+                Some(Ok(s)) => status = s,
+                Some(Err(e)) => {
+                    eprintln!("ladder: {e}");
+                    return ExitCode::FAILURE;
+                }
+                None => {
+                    eprintln!("ladder: {a} needs an argument");
+                    return ExitCode::FAILURE;
+                }
+            },
             "--" => answers.extend(args.by_ref()),
             _ => {
                 if let Some(f) = a.strip_prefix("--file=") {
@@ -80,6 +95,14 @@ fn main() -> ExitCode {
                 } else if let Some(c) = a.strip_prefix("--case=") {
                     match c.parse() {
                         Ok(c) => case = c,
+                        Err(e) => {
+                            eprintln!("ladder: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                } else if let Some(s) = a.strip_prefix("--status=") {
+                    match s.parse() {
+                        Ok(s) => status = s,
                         Err(e) => {
                             eprintln!("ladder: {e}");
                             return ExitCode::FAILURE;
@@ -102,7 +125,11 @@ fn main() -> ExitCode {
             let _ = crossterm::terminal::disable_raw_mode();
             default_hook(info);
         }));
-        TermUi::new().and_then(|ui| App::new(ui, path, loader, today, answers).run())
+        TermUi::new().and_then(|ui| {
+            App::new(ui, path, loader, today, answers)
+                .status(status)
+                .run()
+        })
     } else {
         App::new(
             LineUi::new(io::stdin().lock()),
@@ -111,6 +138,7 @@ fn main() -> ExitCode {
             today,
             answers,
         )
+        .status(status)
         .run()
     };
     match result {
