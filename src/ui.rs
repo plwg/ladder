@@ -1,7 +1,7 @@
 //! Prompting: an inline raw-mode editor with a live fuzzy dropdown, and a plain
 //! line-based fallback used when stdin isn't a terminal.
 
-use crate::fuzzy::{Index, Searcher};
+use crate::fuzzy::{Boost, Index, Searcher};
 use crossterm::cursor::{MoveToColumn, MoveUp};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
@@ -19,6 +19,8 @@ pub struct Spec<'a> {
     /// Text the input starts with (e.g. the old answer after going back).
     pub initial: String,
     pub completion: Option<&'a Index>,
+    /// Extra ranking points for some completions in this prompt.
+    pub boost: Option<&'a Boost>,
     /// The complete result of the answer Enter would give, shown in a box under the
     /// prompt; Ctrl-Y accepts it as is. `None` when that answer needs more input.
     pub preview: Option<&'a PreviewFn<'a>>,
@@ -33,6 +35,7 @@ impl<'a> Spec<'a> {
             default: None,
             initial: String::new(),
             completion: None,
+            boost: None,
             preview: None,
             hint: None,
             error: None,
@@ -166,7 +169,7 @@ impl<'s, 'a> Editor<'s, 'a> {
     fn refresh(&mut self) {
         if let Some(index) = self.spec.completion {
             let q = self.text();
-            self.searcher.search(index, &q);
+            self.searcher.search_boosted(index, &q, self.spec.boost);
             let has = !q.trim().is_empty() && !self.searcher.results.is_empty();
             self.selected = has.then_some(0);
             self.scroll = 0;

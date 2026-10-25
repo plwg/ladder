@@ -10,9 +10,13 @@
 //! Cost of a target = min over k of k + Down presses to reach it (0 if a template
 //! default already matches). New descriptions/accounts can't be completed; they're
 //! counted separately and don't depend on ranking.
+//!
+//! Finally it compares the default weights with and without the context features:
+//! accounts ranked by what went with the ones already entered (and suggested as the
+//! default when likely), and new descriptions borrowing a similar one's accounts.
 
 use ladder::app::Loaded;
-use ladder::fuzzy::{Index, Searcher, Weights};
+use ladder::fuzzy::{Boost, Index, Searcher, Weights};
 use ladder::journal::{Journal, strip_wrap};
 
 #[derive(Clone, Copy)]
@@ -29,7 +33,13 @@ fn typed(text: &str, model: Model) -> &str {
 }
 
 /// Keystrokes to get `target` selected, or None if it isn't in the index.
-fn cost(index: &Index, s: &mut Searcher, target: &str, model: Model) -> Option<usize> {
+fn cost(
+    index: &Index,
+    s: &mut Searcher,
+    target: &str,
+    model: Model,
+    boost: Option<&Boost>,
+) -> Option<usize> {
     let id = index.id(target)?;
     let q = typed(target, model);
     let mut best = usize::MAX;
@@ -38,7 +48,7 @@ fn cost(index: &Index, s: &mut Searcher, target: &str, model: Model) -> Option<u
         if k >= best {
             break;
         }
-        s.search(index, &q[..end]);
+        s.search_boosted(index, &q[..end], boost);
         if let Some(pos) = s.results.iter().position(|&r| r == id) {
             // An empty query selects nothing, so even the top row needs one Down.
             best = best.min(k + pos + usize::from(k == 0));
@@ -60,10 +70,20 @@ struct Stats {
     new_desc: usize,
     new_acct: usize,
     by_default: usize,
+    /// Accounts that were the suggested default (context features only).
+    by_suggestion: usize,
+    /// New descriptions that borrowed a similar one's accounts.
+    borrowed: usize,
     ranked_accts: usize,
 }
 
-fn replay(prefix: &Journal, held_out: &[&str], weights: &Weights, model: Model) -> (Tally, Stats) {
+fn replay(
+    prefix: &Journal,
+    held_out: &[&str],
+    weights: &Weights,
+    model: Model,
+    context: bool,
+) -> (Tally, Stats) {
     let mut data = Loaded::with_weights(prefix.clone(), weights.clone());
     let mut s = Searcher::new();
     let mut t = Tally::default();
@@ -72,6 +92,8 @@ fn replay(prefix: &Journal, held_out: &[&str], weights: &Weights, model: Model) 
         new_desc: 0,
         new_acct: 0,
         by_default: 0,
+        by_suggestion: 0,
+        borrowed: 0,
         ranked_accts: 0,
     };
     for txn in held_out {
@@ -79,20 +101,46 @@ fn replay(prefix: &Journal, held_out: &[&str], weights: &Weights, model: Model) 
         let Some(desc) = parsed.descriptions.first().map(|d| d.text.clone()) else {
             continue;
         };
-        match cost(&data.descriptions, &mut s, &desc, model) {
+        match cost(&data.descriptions, &mut s, &desc, model, None) {
             Some(c) => {
                 t.desc += c;
                 t.desc_top1_empty += usize::from(c == 1);
             }
             None => st.new_desc += 1,
         }
-        let template = data.journal.template(&desc);
-        for (i, p) in parsed.template(&desc).iter().enumerate() {
+        let mut template = data.template(&desc);
+        if context
+            && template.is_empty()
+            && let Some(borrowed) = data.borrow(&desc)
+        {
+            template = borrowed.postings;
+            st.borrowed += 1;
+        }
+        let actual = parsed.template(&desc);
+        for (i, p) in actual.iter().enumerate() {
             if template.get(i).is_some_and(|d| d.account == p.account) {
                 st.by_default += 1;
                 continue;
             }
-            match cost(&data.accounts, &mut s, strip_wrap(&p.account), model) {
+            let entered: Vec<&str> = actual[..i].iter().map(|p| strip_wrap(&p.account)).collect();
+            let (boost, suggestion) = if context {
+                data.account_context(&entered)
+            } else {
+                Default::default()
+            };
+            // Postings before the last one leave the transaction unbalanced, so a
+            // suggestion is offered wherever the template has no account.
+            if template.get(i).is_none() && suggestion.as_deref() == Some(strip_wrap(&p.account)) {
+                st.by_suggestion += 1;
+                continue;
+            }
+            match cost(
+                &data.accounts,
+                &mut s,
+                strip_wrap(&p.account),
+                model,
+                Some(&boost),
+            ) {
                 Some(c) => {
                     st.ranked_accts += 1;
                     t.acct += c;
@@ -146,6 +194,7 @@ fn main() {
                     freq_step,
                     recency,
                     recent_boost,
+                    ..Weights::default()
                 });
             }
         }
@@ -154,6 +203,7 @@ fn main() {
         freq_step: 0,
         recency: 0.0,
         recent_boost: vec![],
+        context: 0.0,
     }); // match quality only
 
     let current = Weights::default();
@@ -161,16 +211,16 @@ fn main() {
         let mut rows: Vec<(usize, &Weights, Tally)> = configs
             .iter()
             .map(|w| {
-                let (t, _) = replay(&prefix, &held_out, w, model);
+                let (t, _) = replay(&prefix, &held_out, w, model, true);
                 (t.desc + t.acct, w, t)
             })
             .collect();
         rows.sort_by_key(|r| r.0);
-        let (_, st) = replay(&prefix, &held_out, &current, model);
+        let (_, st) = replay(&prefix, &held_out, &current, model, true);
         println!(
             "\n== typing model: {name} ==  {} txns; {} new descriptions, {} new accounts (not rankable); \
-             {} accounts taken from template default; {} accounts ranked",
-            st.txns, st.new_desc, st.new_acct, st.by_default, st.ranked_accts
+             {} accounts taken from template default; {} from suggestion; {} accounts ranked",
+            st.txns, st.new_desc, st.new_acct, st.by_default, st.by_suggestion, st.ranked_accts
         );
         println!(
             "{:>5} {:>5} {:>5} {:>6} {:>6}  {:<5} {:<7} boost",
@@ -227,5 +277,18 @@ fn main() {
                 best.join(" | ")
             );
         }
+        let (off_t, off) = replay(&prefix, &held_out, &current, model, false);
+        let (on_t, on) = replay(&prefix, &held_out, &current, model, true);
+        println!(
+            "  context features: account keystrokes {} -> {}; template defaults {} -> {}; \
+             suggestions {}; {} of {} new descriptions borrowed accounts",
+            off_t.acct,
+            on_t.acct,
+            off.by_default,
+            on.by_default,
+            on.by_suggestion,
+            on.borrowed,
+            on.new_desc
+        );
     }
 }
