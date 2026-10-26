@@ -32,6 +32,7 @@ Keys:
   Enter             accept selection, else typed text, else the [default]
   Alt-Enter         accept the typed text exactly as typed
   C-y               save the transaction shown in the preview box
+  C-t               the same, but first change this posting's amount
   Esc               clear input; on an empty prompt go back a step (also: < Enter)
   C-d / C-c         quit (the unfinished transaction is discarded)
 ";

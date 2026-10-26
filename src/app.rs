@@ -283,6 +283,9 @@ struct Draft {
     sample_amount: Option<String>,
     postings: Vec<Posting>,
     pending_account: Option<String>,
+    /// Ctrl-T was used: save once the pending amount is given, the template
+    /// supplying the rest.
+    amending: bool,
     finished: bool,
     status: Status,
 }
@@ -482,8 +485,13 @@ fn complete(draft: &Draft, step: Step, styles: &Styles) -> Option<Vec<Posting>> 
             rest.extend_from_slice(tail);
         }
     }
+    finish(fixed, &rest, styles)
+}
+
+/// `fixed` followed by `rest` filled in from the template, if that needs no input.
+fn finish(fixed: Vec<Posting>, rest: &[TemplatePosting], styles: &Styles) -> Option<Vec<Posting>> {
     let total = fixed.len() + rest.len();
-    let postings = fill_template(fixed, &rest, styles);
+    let postings = fill_template(fixed, rest, styles);
     (postings.len() == total && is_balanced(&postings, styles)).then_some(postings)
 }
 
@@ -619,13 +627,14 @@ impl<U: Ui> App<U> {
                     return Ok(());
                 }
                 Answer::Back => self.back(),
-                Answer::Text(_) | Answer::Accept(_) => {}
+                Answer::Text(_) | Answer::Accept(_) | Answer::Amend(_) => {}
             }
         }
     }
 
     fn back(&mut self) {
         let d = &mut self.draft;
+        d.amending = false;
         if d.finished {
             d.finished = false;
         } else if let Some(acct) = d.pending_account.take() {
@@ -691,8 +700,9 @@ impl<U: Ui> App<U> {
         let mut spec = Spec::new("Description");
         spec.completion = Some(&data.descriptions);
         spec.preview = Some(&preview);
+        spec.amend = true;
         let answer = self.p.ask(spec)?;
-        if let Answer::Text(t) | Answer::Accept(t) = &answer {
+        if let Answer::Text(t) | Answer::Accept(t) | Answer::Amend(t) = &answer {
             let (desc, comment) = split_comment(t);
             self.draft.template = data.template(&desc);
             self.draft.sample_amount = None;
@@ -705,10 +715,30 @@ impl<U: Ui> App<U> {
             self.draft.description = Some(desc);
             self.draft.comment = comment;
         }
-        if let Answer::Accept(_) = &answer {
-            self.accept(Step::Description)?;
+        match &answer {
+            Answer::Accept(_) => self.accept(Step::Description)?,
+            Answer::Amend(_) => self.amend(Step::Description),
+            _ => {}
         }
         Ok(answer)
+    }
+
+    /// Ctrl-T: take the previewed transaction's postings up to this prompt's, and
+    /// ask for that one's amount; the template supplies the rest when it's given.
+    fn amend(&mut self, step: Step) {
+        let n = self.draft.postings.len();
+        let styles = &self.data().journal.styles;
+        let Some(mut postings) = complete(&self.draft, step, styles) else {
+            return;
+        };
+        if postings.len() <= n {
+            return; // finishing: there's no posting to amend
+        }
+        postings.truncate(n + 1);
+        let p = postings.pop().expect("posting n");
+        self.draft.postings = postings;
+        self.draft.pending_account = Some(p.account);
+        self.draft.amending = true;
     }
 
     /// Ctrl-Y: save the previewed transaction, if it's complete.
@@ -763,9 +793,11 @@ impl<U: Ui> App<U> {
         spec.completion = Some(&data.accounts);
         spec.boost = Some(&boost);
         spec.preview = Some(&preview);
+        spec.amend = true;
         let answer = self.p.ask(spec)?;
         match &answer {
             Answer::Accept(t) => self.accept(Step::Account(t))?,
+            Answer::Amend(t) => self.amend(Step::Account(t)),
             Answer::Text(t) => {
                 let t = t.trim();
                 if t.is_empty() || t == "." {
@@ -801,7 +833,12 @@ impl<U: Ui> App<U> {
         let draft = &self.draft;
         let default = default_amount(draft, styles);
         let preview = |t: &str| complete(draft, Step::Amount(t), styles).map(|p| draft.render(&p));
-        let mut spec = Spec::new(format!("Amount {}", n + 1));
+        let label = if draft.amending {
+            format!("Amount {} (Enter saves)", n + 1)
+        } else {
+            format!("Amount {}", n + 1)
+        };
+        let mut spec = Spec::new(label);
         spec.default = default.clone();
         let balance = sum(&draft.postings);
         if n > 0 && !balance.is_balanced(styles) {
@@ -848,6 +885,18 @@ impl<U: Ui> App<U> {
             comment,
             weight: pa.weight,
         });
+        if std::mem::take(&mut self.draft.amending) {
+            let n = self.draft.postings.len();
+            let rest = self.draft.template.get(n..).unwrap_or_default();
+            let styles = &self.data().journal.styles;
+            // Otherwise (e.g. the amount left more than one commodity to balance)
+            // carry on prompting.
+            if let Some(postings) = finish(self.draft.postings.clone(), rest, styles) {
+                self.draft.postings = postings;
+                self.p.say(&self.render_transaction())?;
+                self.save_draft()?;
+            }
+        }
         Ok(answer)
     }
 
@@ -1194,6 +1243,77 @@ mod tests {
             added,
             "\n2026-10-20 Blue Bottle Roasters\n    expenses:coffee    $4.50\n    liabilities:amex  $-4.50\n\
              \n2026-10-20 Somewhere New\n    expenses:coffee       $3\n    liabilities:amex  $-3.00\n"
+        );
+    }
+
+    /// Gives scripted answers, recording each prompt's label.
+    struct Script {
+        answers: VecDeque<Answer>,
+        labels: Vec<String>,
+    }
+
+    impl Ui for Script {
+        fn ask(&mut self, spec: &Spec) -> io::Result<Answer> {
+            self.labels.push(spec.label.clone());
+            Ok(match self.answers.pop_front() {
+                Some(Answer::Text(t)) if t.is_empty() => {
+                    Answer::Text(spec.default.clone().unwrap_or_default())
+                }
+                Some(a) => a,
+                None => Answer::Quit,
+            })
+        }
+
+        fn say(&mut self, _: &str) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ctrl_t_changes_only_the_amount() {
+        let dir = std::env::temp_dir().join(format!("ladder-amend-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("j.journal");
+        std::fs::write(&path, CAFES).unwrap();
+        let loader = Loaded::spawn(path.clone(), Case::default());
+        let text = |t: &str| Answer::Text(t.into());
+        // Ctrl-T on a description, then on a different account 1, whose amount
+        // defaults to the one just saved.
+        let answers = [
+            text("2026-10-20"),
+            Answer::Amend("Blue Bottle Coffee".into()),
+            text("6"),
+            text(""),
+            text("Blue Bottle Coffee"),
+            Answer::Amend("expenses:food".into()),
+            text(""),
+        ];
+        let ui = Script {
+            answers: answers.into(),
+            labels: Vec::new(),
+        };
+        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let mut app = App::new(ui, path.clone(), loader, today, Vec::new());
+        app.run().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            app.p.ui.labels,
+            [
+                "Date",
+                "Description",
+                "Amount 1 (Enter saves)",
+                "Date",
+                "Description",
+                "Account 1",
+                "Amount 1 (Enter saves)",
+                "Date",
+            ]
+        );
+        assert_eq!(
+            &text[CAFES.len()..],
+            "\n2026-10-20 Blue Bottle Coffee\n    expenses:coffee    $6.00\n    liabilities:amex  $-6.00\n\
+             \n2026-10-20 Blue Bottle Coffee\n    expenses:food      $6.00\n    liabilities:amex  $-6.00\n"
         );
     }
 

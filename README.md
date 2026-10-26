@@ -19,7 +19,7 @@ accounts, so most transactions take only a few keystrokes.
 - **Smart account suggestions**: accounts you usually use together rank first,
   for example the card you normally pay for coffee with.
 - **Live preview** of the transaction that will be saved. Press Ctrl-Y to save
-  it straight away.
+  it straight away, or Ctrl-T to change just the amount first.
 - **Automatic balancing and arithmetic**: the last amount fills itself in, and
   amounts can be expressions like `45.80 + 4.20`.
 - **Flexible dates** such as `today`, `y`, `-3` or `10/19`.
@@ -59,7 +59,8 @@ Then:
 2. Start typing a description. Press Enter to pick the highlighted match, or
    Alt-Enter to use exactly what you typed.
 3. Accept or change each account and amount. Press Ctrl-Y at any point to save
-   the transaction shown in the preview.
+   the transaction shown in the preview, or Ctrl-T if only its amount needs
+   changing.
 4. Press Ctrl-D to quit.
 
 ## Learn more

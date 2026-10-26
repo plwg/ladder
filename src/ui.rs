@@ -24,6 +24,8 @@ pub struct Spec<'a> {
     /// The complete result of the answer Enter would give, shown in a box under the
     /// prompt; Ctrl-Y accepts it as is. `None` when that answer needs more input.
     pub preview: Option<&'a PreviewFn<'a>>,
+    /// Whether Ctrl-T can take the preview with this prompt's posting's amount changed.
+    pub amend: bool,
     pub hint: Option<String>,
     pub error: Option<String>,
 }
@@ -37,6 +39,7 @@ impl<'a> Spec<'a> {
             completion: None,
             boost: None,
             preview: None,
+            amend: false,
             hint: None,
             error: None,
         }
@@ -55,6 +58,8 @@ pub enum Answer {
     Text(String),
     /// An answer given with Ctrl-Y: take its preview as is.
     Accept(String),
+    /// An answer given with Ctrl-T: take its preview, but ask for this posting's amount.
+    Amend(String),
     Back,
     Quit,
 }
@@ -277,6 +282,10 @@ impl<'s, 'a> Editor<'s, 'a> {
                 Some(t) if self.preview().is_some() => Outcome::Done(Answer::Accept(t)),
                 _ => Outcome::MOVED,
             },
+            KeyCode::Char('t') if ctrl && self.spec.amend => match self.pending() {
+                Some(t) if self.preview().is_some() => Outcome::Done(Answer::Amend(t)),
+                _ => Outcome::MOVED,
+            },
             KeyCode::Char('c') if ctrl => Outcome::Done(Answer::Quit),
             KeyCode::Char('d') if ctrl && self.input.is_empty() => Outcome::Done(Answer::Quit),
             KeyCode::Esc if self.input.is_empty() => Outcome::Done(Answer::Back),
@@ -497,7 +506,12 @@ impl<'s, 'a> Editor<'s, 'a> {
                 out.queue(Print("\r\n"))?;
                 lines += 1;
             }
-            lines += render_preview(out, &p, width)?;
+            let title = if self.spec.amend {
+                " Ctrl-Y saves this · Ctrl-T edits the amount "
+            } else {
+                " Ctrl-Y saves this "
+            };
+            lines += render_preview(out, &p, title, width)?;
         }
         if lines > 0 {
             out.queue(MoveUp(lines))?;
@@ -518,15 +532,16 @@ fn truncate(s: &str, width: usize) -> String {
 }
 
 /// Draw `text` in a box whose bottom edge is titled with how to accept it; returns the lines used.
-fn render_preview(out: &mut impl Write, text: &str, width: usize) -> io::Result<u16> {
-    const TITLE: &str = " Ctrl-Y saves this ";
+fn render_preview(out: &mut impl Write, text: &str, title: &str, width: usize) -> io::Result<u16> {
     let body: Vec<&str> = text.lines().take(MAX_PREVIEW_ROWS).collect();
     let text_width = |s: &str| s.chars().map(char_width).sum::<usize>();
+    let title = truncate(title, width.saturating_sub(4));
+    let title_width = text_width(&title);
     // Inner width: the widest line plus a space either side, within the terminal.
     let inner = body
         .iter()
         .map(|l| text_width(l) + 2)
-        .chain([TITLE.len() + 2])
+        .chain([title_width + 2])
         .max()
         .unwrap_or(0)
         .min(width.saturating_sub(2));
@@ -546,8 +561,8 @@ fn render_preview(out: &mut impl Write, text: &str, width: usize) -> io::Result<
         queue!(out, Print(" "), Print(&shown), Print(pad))?;
         dim(out, "│")?;
     }
-    let fill = inner.saturating_sub(TITLE.len() + 1);
-    dim(out, &format!("\r\n╰─{TITLE}{}╯", "─".repeat(fill)))?;
+    let fill = inner.saturating_sub(title_width + 1);
+    dim(out, &format!("\r\n╰─{title}{}╯", "─".repeat(fill)))?;
     Ok(body.len() as u16 + 2)
 }
 
@@ -615,7 +630,7 @@ impl Ui for TermUi {
                     match ed.key(k) {
                         Outcome::Done(answer) => {
                             let shown = match &answer {
-                                Answer::Text(t) | Answer::Accept(t) => t.clone(),
+                                Answer::Text(t) | Answer::Accept(t) | Answer::Amend(t) => t.clone(),
                                 _ => ed.text(),
                             };
                             queue!(self.out, MoveToColumn(0), Clear(ClearType::FromCursorDown))?;

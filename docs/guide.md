@@ -45,6 +45,7 @@ so it can be scripted.
 | Enter | accept the selection, else your typed text, else the `[default]` |
 | Alt-Enter | accept exactly what you typed (use this for a new description) |
 | Ctrl-Y | save the transaction shown in the preview box |
+| Ctrl-T | take the preview box's transaction, but change this posting's amount first (see [Changing just the amount](#changing-just-the-amount)) |
 | Esc | clear the input; on an empty prompt, go back a step (or type `<`) |
 | `.` | finish the transaction when it already balances |
 | Ctrl-D / Ctrl-C | quit (an unfinished transaction is discarded) |
@@ -95,6 +96,37 @@ The usual editing keys also work: Ctrl-A, Ctrl-E, Ctrl-W, Ctrl-U and Ctrl-K.
   `comment` blocks, virtual postings, and prices (`@`, `@@`) when checking
   balance.
 - Transactions you add are completable straight away in the same session.
+
+### Changing just the amount
+
+Often the template is right except for the amount: the same café, the same
+card, a different bill. At a description or account prompt, while the preview
+box is showing, press **Ctrl-T** instead of Ctrl-Y. ladder keeps the previewed
+transaction and asks only for the amount of the posting that prompt is for:
+
+```
+Description: Blue Bottle Coffee          ← Ctrl-T here
+Amount 1 (Enter saves) [$4.00]: 6
+2026-10-26 Blue Bottle Coffee
+    expenses:coffee    $6.00
+    liabilities:amex  $-6.00
+Saved to ~/.hledger.journal.
+```
+
+- The preview box keeps updating as you type the amount, and the usual amount
+  rules apply: arithmetic, a bare number taking the default's commodity, and
+  `; comment`.
+- Enter saves. The remaining postings come from the template, with the last
+  one balancing the new amount.
+- At the description prompt it's the first posting's amount. At an account
+  prompt it's that account's, so you can change both the account and the
+  amount: type or select the account, then press Ctrl-T.
+- If the transaction can't be balanced without more input (e.g. the new amount
+  leaves more than one commodity to balance), ladder carries on with the usual
+  prompts instead of saving.
+- Esc at the amount prompt goes back as usual.
+- The box's bottom edge reads `Ctrl-Y saves this · Ctrl-T edits the amount`
+  where Ctrl-T is available.
 
 ## Developer tools
 
