@@ -833,8 +833,10 @@ impl<U: Ui> App<U> {
         let draft = &self.draft;
         let default = default_amount(draft, styles);
         let preview = |t: &str| complete(draft, Step::Amount(t), styles).map(|p| draft.render(&p));
+        // Ctrl-T skipped the account prompt, so say whose amount this is.
         let label = if draft.amending {
-            format!("Amount {} (Enter saves)", n + 1)
+            let account = draft.pending_account.as_deref().unwrap_or_default();
+            format!("Amount {} for {account} (Enter saves)", n + 1)
         } else {
             format!("Amount {}", n + 1)
         };
@@ -1302,11 +1304,11 @@ mod tests {
             [
                 "Date",
                 "Description",
-                "Amount 1 (Enter saves)",
+                "Amount 1 for expenses:coffee (Enter saves)",
                 "Date",
                 "Description",
                 "Account 1",
-                "Amount 1 (Enter saves)",
+                "Amount 1 for expenses:food (Enter saves)",
                 "Date",
             ]
         );

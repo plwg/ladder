@@ -102,11 +102,12 @@ The usual editing keys also work: Ctrl-A, Ctrl-E, Ctrl-W, Ctrl-U and Ctrl-K.
 Often the template is right except for the amount: the same café, the same
 card, a different bill. At a description or account prompt, while the preview
 box is showing, press **Ctrl-T** instead of Ctrl-Y. ladder keeps the previewed
-transaction and asks only for the amount of the posting that prompt is for:
+transaction and asks only for the amount of the posting that prompt is for,
+naming its account:
 
 ```
 Description: Blue Bottle Coffee          ← Ctrl-T here
-Amount 1 (Enter saves) [$4.00]: 6
+Amount 1 for expenses:coffee (Enter saves) [$4.00]: 6
 2026-10-26 Blue Bottle Coffee
     expenses:coffee    $6.00
     liabilities:amex  $-6.00
@@ -121,6 +122,9 @@ Saved to ~/.hledger.journal.
 - At the description prompt it's the first posting's amount. At an account
   prompt it's that account's, so you can change both the account and the
   amount: type or select the account, then press Ctrl-T.
+- Check the account in the prompt before typing: if the template lists the
+  paying account first (`assets:checking  $-40` above `expenses:food`), the
+  amount asked for is the checking one, and needs its minus sign.
 - If the transaction can't be balanced without more input (e.g. the new amount
   leaves more than one commodity to balance), ladder carries on with the usual
   prompts instead of saving.
