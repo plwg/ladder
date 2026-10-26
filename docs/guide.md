@@ -107,7 +107,7 @@ naming its account:
 
 ```
 Description: Blue Bottle Coffee          ← Ctrl-T here
-Amount 1 for expenses:coffee (Enter saves) [$4.00]: 6
+Amount 1 for expenses:coffee [$4.00]: 6
 2026-10-26 Blue Bottle Coffee
     expenses:coffee    $6.00
     liabilities:amex  $-6.00
@@ -118,7 +118,8 @@ Saved to ~/.hledger.journal.
   rules apply: arithmetic, a bare number taking the default's commodity, and
   `; comment`.
 - Enter saves. The remaining postings come from the template, with the last
-  one balancing the new amount.
+  one balancing the new amount. Enter on an empty prompt takes the `[default]`,
+  so it saves the transaction unchanged, just as Ctrl-Y would have.
 - At the description prompt it's the first posting's amount. At an account
   prompt it's that account's, so you can change both the account and the
   amount: type or select the account, then press Ctrl-T.

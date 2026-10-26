@@ -836,7 +836,7 @@ impl<U: Ui> App<U> {
         // Ctrl-T skipped the account prompt, so say whose amount this is.
         let label = if draft.amending {
             let account = draft.pending_account.as_deref().unwrap_or_default();
-            format!("Amount {} for {account} (Enter saves)", n + 1)
+            format!("Amount {} for {account}", n + 1)
         } else {
             format!("Amount {}", n + 1)
         };
@@ -1304,11 +1304,11 @@ mod tests {
             [
                 "Date",
                 "Description",
-                "Amount 1 for expenses:coffee (Enter saves)",
+                "Amount 1 for expenses:coffee",
                 "Date",
                 "Description",
                 "Account 1",
-                "Amount 1 for expenses:food (Enter saves)",
+                "Amount 1 for expenses:food",
                 "Date",
             ]
         );
