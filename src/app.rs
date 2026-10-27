@@ -3,8 +3,9 @@
 use crate::amount::{Amount, Mixed, PostingAmount, Styles, parse_posting_amount};
 use crate::case::Case;
 use crate::dates::parse_smart_date;
-use crate::fuzzy::{Index, Weights};
+use crate::fuzzy::{Boost, Index, Weights};
 use crate::journal::{Journal, TemplatePosting, Usage, strip_wrap};
+use crate::status::Status;
 use crate::ui::{Answer, Spec, Ui};
 use chrono::NaiveDate;
 use rustc_hash::FxHashMap;
@@ -24,6 +25,42 @@ pub struct Loaded {
     case: Case,
     /// Description groups by [`Case::key`].
     groups: FxHashMap<String, Group>,
+    /// Group keys, in the order their words are indexed under.
+    keys: Vec<String>,
+    /// Each word of a description, with the groups (indices into `keys`) using it.
+    words: FxHashMap<String, Vec<u32>>,
+    /// Points for an account that always went with one already entered.
+    context: f64,
+}
+
+/// How much of a new description's word weight a past description must share to
+/// lend it its accounts.
+const BORROW_MIN: f64 = 0.5;
+/// How likely an account must be, given those already entered, to be the default.
+const SUGGEST_MIN: f64 = 0.5;
+
+/// The distinct lowercase words of a description, leaving out bare numbers and
+/// single characters, which say little about the payee.
+fn words(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().nth(1).is_some() && !w.chars().all(|c| c.is_ascii_digit()))
+        .map(str::to_lowercase)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Accounts lent to a new description by a similar past one.
+#[derive(Debug, PartialEq)]
+pub struct Borrowed {
+    /// The past description, as shown.
+    pub source: String,
+    /// Its latest transaction's postings, without amounts.
+    pub postings: Vec<TemplatePosting>,
+    /// An amount it was written with, whose commodity a bare number takes.
+    pub sample: Option<String>,
 }
 
 /// The spellings of a description that are shown as one entry.
@@ -77,6 +114,7 @@ impl Loaded {
                 .collect(),
             weights.clone(),
         );
+        let context = weights.context;
         let accounts = Index::build_with(
             journal
                 .accounts
@@ -85,13 +123,101 @@ impl Loaded {
                 .collect(),
             weights,
         );
-        Loaded {
+        let mut loaded = Loaded {
             journal,
             descriptions,
             accounts,
             case,
             groups,
+            keys: Vec::with_capacity(order.len()),
+            words: FxHashMap::default(),
+            context,
+        };
+        for key in order {
+            loaded.add_key(key);
         }
+        loaded
+    }
+
+    fn add_key(&mut self, key: String) {
+        let g = self.keys.len() as u32;
+        for w in words(&key) {
+            self.words.entry(w).or_default().push(g);
+        }
+        self.keys.push(key);
+    }
+
+    /// For a description never used before, the past description that shares most
+    /// of its distinctive words.
+    pub fn borrow(&self, text: &str) -> Option<Borrowed> {
+        if self.groups.contains_key(&self.case.key(text)) {
+            return None;
+        }
+        // Rare words say more about the payee than common ones.
+        let n = self.keys.len() as f64;
+        let idf = |df: usize| ((n + 1.0) / (df as f64 + 1.0)).ln();
+        let mut total = 0.0;
+        let mut shared: FxHashMap<u32, f64> = FxHashMap::default();
+        for w in words(text) {
+            let groups = self.words.get(&w).map_or(&[][..], Vec::as_slice);
+            let weight = idf(groups.len());
+            total += weight;
+            for &g in groups {
+                *shared.entry(g).or_default() += weight;
+            }
+        }
+        let rank = |g: u32, score: f64| {
+            let u = &self.groups[&self.keys[g as usize]].usage;
+            (score, u.count, u.last_seq)
+        };
+        let (g, _) = shared
+            .into_iter()
+            .filter(|&(_, score)| total > 0.0 && score / total >= BORROW_MIN)
+            .max_by(|a, b| rank(a.0, a.1).partial_cmp(&rank(b.0, b.1)).expect("finite"))?;
+        let group = &self.groups[&self.keys[g as usize]];
+        let mut postings = self.journal.template(&group.latest);
+        let sample = postings.iter().find_map(|p| p.amount.clone());
+        for p in &mut postings {
+            p.amount = None;
+        }
+        (!postings.is_empty()).then(|| Borrowed {
+            source: group.shown.clone(),
+            postings,
+            sample,
+        })
+    }
+
+    /// A ranking boost for accounts by how often they went with the `entered` ones,
+    /// and the one to suggest if it's likely enough.
+    pub fn account_context(&self, entered: &[&str]) -> (Boost, Option<String>) {
+        let mut likely: FxHashMap<&str, f64> = FxHashMap::default();
+        for a in entered {
+            let Some((txns, partners)) = self.journal.partners(a) else {
+                continue;
+            };
+            for (b, n) in partners {
+                // Smoothed, so one or two sightings count for less than many.
+                let p = f64::from(n) / f64::from(txns + 2);
+                let e = likely.entry(b).or_default();
+                *e = e.max(p);
+            }
+        }
+        for a in entered {
+            likely.remove(a);
+        }
+        let boost = likely
+            .iter()
+            .filter_map(|(b, p)| {
+                let points = (p * self.context) as u32;
+                (points > 0).then_some((self.accounts.id(b)?, points))
+            })
+            .collect();
+        let suggestion = likely
+            .into_iter()
+            .filter(|&(_, p)| p >= SUGGEST_MIN)
+            .max_by(|a, b| a.1.partial_cmp(&b.1).expect("finite").then(b.0.cmp(a.0)))
+            .map(|(b, _)| b.to_owned());
+        (boost, suggestion)
     }
 
     /// Postings of the most recent transaction with a spelling of `text`.
@@ -110,15 +236,19 @@ impl Loaded {
         let Some(desc) = added.descriptions.first().map(|d| d.text.as_str()) else {
             return;
         };
-        if let Some(d) = self.journal.description(desc) {
+        if let Some(last_seq) = self.journal.description(desc).map(|d| d.usage.last_seq) {
             let case = self.case;
-            let g = self.groups.entry(case.key(desc)).or_insert_with(|| Group {
+            let key = case.key(desc);
+            if !self.groups.contains_key(&key) {
+                self.add_key(key.clone());
+            }
+            let g = self.groups.entry(key).or_insert_with(|| Group {
                 shown: case.apply(desc),
                 ..Group::default()
             });
             desc.clone_into(&mut g.latest);
             g.usage.count += 1;
-            g.usage.last_seq = d.usage.last_seq;
+            g.usage.last_seq = last_seq;
             self.descriptions.upsert(&g.shown, &g.usage);
         }
         for p in added.template(desc) {
@@ -148,9 +278,16 @@ struct Draft {
     description: Option<String>,
     comment: Option<String>,
     template: Vec<TemplatePosting>,
+    /// An amount of the description `template` was borrowed from, if it was, whose
+    /// commodity a bare number takes.
+    sample_amount: Option<String>,
     postings: Vec<Posting>,
     pending_account: Option<String>,
+    /// Ctrl-T was used: save once the pending amount is given, the template
+    /// supplying the rest.
+    amending: bool,
     finished: bool,
+    status: Status,
 }
 
 impl Draft {
@@ -161,6 +298,7 @@ impl Draft {
     fn render(&self, postings: &[Posting]) -> String {
         render_transaction(
             self.date.expect("date"),
+            self.status,
             self.description.as_deref().unwrap_or(""),
             self.comment.as_deref(),
             postings,
@@ -336,7 +474,8 @@ fn complete(draft: &Draft, step: Step, styles: &Styles) -> Option<Vec<Posting>> 
         Step::Amount(a) => {
             let (text, comment) = split_comment(a);
             let default = default_amount(draft, styles);
-            let (pa, amount, _) = resolve_amount(&text, default.as_deref(), styles).ok()?;
+            let like = default.as_deref().or(draft.sample_amount.as_deref());
+            let (pa, amount, _) = resolve_amount(&text, like, styles).ok()?;
             fixed.push(Posting {
                 account: draft.pending_account.clone()?,
                 amount,
@@ -346,8 +485,13 @@ fn complete(draft: &Draft, step: Step, styles: &Styles) -> Option<Vec<Posting>> 
             rest.extend_from_slice(tail);
         }
     }
+    finish(fixed, &rest, styles)
+}
+
+/// `fixed` followed by `rest` filled in from the template, if that needs no input.
+fn finish(fixed: Vec<Posting>, rest: &[TemplatePosting], styles: &Styles) -> Option<Vec<Posting>> {
     let total = fixed.len() + rest.len();
-    let postings = fill_template(fixed, &rest, styles);
+    let postings = fill_template(fixed, rest, styles);
     (postings.len() == total && is_balanced(&postings, styles)).then_some(postings)
 }
 
@@ -396,6 +540,7 @@ pub struct App<U: Ui> {
     today: NaiveDate,
     last_date: Option<NaiveDate>,
     draft: Draft,
+    status: Status,
 }
 
 impl<U: Ui> App<U> {
@@ -419,6 +564,21 @@ impl<U: Ui> App<U> {
             today,
             last_date: None,
             draft: Draft::default(),
+            status: Status::default(),
+        }
+    }
+
+    /// The status mark (`!` or `*`) to write on every added transaction.
+    pub fn status(mut self, status: Status) -> Self {
+        self.status = status;
+        self.draft = self.new_draft();
+        self
+    }
+
+    fn new_draft(&self) -> Draft {
+        Draft {
+            status: self.status,
+            ..Draft::default()
         }
     }
 
@@ -467,13 +627,14 @@ impl<U: Ui> App<U> {
                     return Ok(());
                 }
                 Answer::Back => self.back(),
-                Answer::Text(_) | Answer::Accept(_) => {}
+                Answer::Text(_) | Answer::Accept(_) | Answer::Amend(_) => {}
             }
         }
     }
 
     fn back(&mut self) {
         let d = &mut self.draft;
+        d.amending = false;
         if d.finished {
             d.finished = false;
         } else if let Some(acct) = d.pending_account.take() {
@@ -486,6 +647,7 @@ impl<U: Ui> App<U> {
             };
         } else if let Some(desc) = d.description.take() {
             d.template.clear();
+            d.sample_amount = None;
             self.p.prefill = match d.comment.take() {
                 Some(c) => format!("{desc} ; {c}"),
                 None => desc,
@@ -521,6 +683,7 @@ impl<U: Ui> App<U> {
             .get_or_insert_with(|| Loaded::new(Journal::default()));
         let data = &*data;
         let date = self.draft.date;
+        let status = self.draft.status;
         let preview = |text: &str| {
             let (desc, comment) = split_comment(text);
             let draft = Draft {
@@ -528,6 +691,7 @@ impl<U: Ui> App<U> {
                 template: data.template(&desc),
                 description: Some(desc),
                 comment,
+                status,
                 ..Draft::default()
             };
             let postings = complete(&draft, Step::Description, &data.journal.styles)?;
@@ -536,17 +700,45 @@ impl<U: Ui> App<U> {
         let mut spec = Spec::new("Description");
         spec.completion = Some(&data.descriptions);
         spec.preview = Some(&preview);
+        spec.amend = true;
         let answer = self.p.ask(spec)?;
-        if let Answer::Text(t) | Answer::Accept(t) = &answer {
+        if let Answer::Text(t) | Answer::Accept(t) | Answer::Amend(t) = &answer {
             let (desc, comment) = split_comment(t);
             self.draft.template = data.template(&desc);
+            self.draft.sample_amount = None;
+            if self.draft.template.is_empty()
+                && let Some(b) = data.borrow(&desc)
+            {
+                self.draft.template = b.postings;
+                self.draft.sample_amount = b.sample;
+            }
             self.draft.description = Some(desc);
             self.draft.comment = comment;
         }
-        if let Answer::Accept(_) = &answer {
-            self.accept(Step::Description)?;
+        match &answer {
+            Answer::Accept(_) => self.accept(Step::Description)?,
+            Answer::Amend(_) => self.amend(Step::Description),
+            _ => {}
         }
         Ok(answer)
+    }
+
+    /// Ctrl-T: take the previewed transaction's postings up to this prompt's, and
+    /// ask for that one's amount; the template supplies the rest when it's given.
+    fn amend(&mut self, step: Step) {
+        let n = self.draft.postings.len();
+        let styles = &self.data().journal.styles;
+        let Some(mut postings) = complete(&self.draft, step, styles) else {
+            return;
+        };
+        if postings.len() <= n {
+            return; // finishing: there's no posting to amend
+        }
+        postings.truncate(n + 1);
+        let p = postings.pop().expect("posting n");
+        self.draft.postings = postings;
+        self.draft.pending_account = Some(p.account);
+        self.draft.amending = true;
     }
 
     /// Ctrl-Y: save the previewed transaction, if it's complete.
@@ -572,9 +764,19 @@ impl<U: Ui> App<U> {
     fn ask_account(&mut self) -> io::Result<Answer> {
         let n = self.draft.postings.len();
         let balanced = self.is_balanced();
-        let default = self.draft.template.get(n).map(|p| p.account.clone());
         let data = self.data.as_ref().expect("loaded");
         let draft = &self.draft;
+        let entered: Vec<&str> = draft
+            .postings
+            .iter()
+            .map(|p| strip_wrap(&p.account))
+            .collect();
+        let (boost, suggestion) = data.account_context(&entered);
+        let default = match draft.template.get(n) {
+            Some(p) => Some(p.account.clone()),
+            None if !balanced => suggestion,
+            None => None,
+        };
         let styles = &data.journal.styles;
         let preview = |t: &str| complete(draft, Step::Account(t), styles).map(|p| draft.render(&p));
         let label = if balanced {
@@ -589,10 +791,13 @@ impl<U: Ui> App<U> {
         let mut spec = Spec::new(label);
         spec.default = default;
         spec.completion = Some(&data.accounts);
+        spec.boost = Some(&boost);
         spec.preview = Some(&preview);
+        spec.amend = true;
         let answer = self.p.ask(spec)?;
         match &answer {
             Answer::Accept(t) => self.accept(Step::Account(t))?,
+            Answer::Amend(t) => self.amend(Step::Account(t)),
             Answer::Text(t) => {
                 let t = t.trim();
                 if t.is_empty() || t == "." {
@@ -628,7 +833,14 @@ impl<U: Ui> App<U> {
         let draft = &self.draft;
         let default = default_amount(draft, styles);
         let preview = |t: &str| complete(draft, Step::Amount(t), styles).map(|p| draft.render(&p));
-        let mut spec = Spec::new(format!("Amount {}", n + 1));
+        // Ctrl-T skipped the account prompt, so say whose amount this is.
+        let label = if draft.amending {
+            let account = draft.pending_account.as_deref().unwrap_or_default();
+            format!("Amount {} for {account}", n + 1)
+        } else {
+            format!("Amount {}", n + 1)
+        };
+        let mut spec = Spec::new(label);
         spec.default = default.clone();
         let balance = sum(&draft.postings);
         if n > 0 && !balance.is_balanced(styles) {
@@ -651,7 +863,8 @@ impl<U: Ui> App<U> {
             return Ok(answer);
         }
         let styles = &mut self.data.as_mut().expect("loaded").journal.styles;
-        let (pa, text, restyled) = match resolve_amount(&text, default.as_deref(), styles) {
+        let like = default.as_deref().or(self.draft.sample_amount.as_deref());
+        let (pa, text, restyled) = match resolve_amount(&text, like, styles) {
             Ok(r) => r,
             Err(e) => {
                 self.p.retry(
@@ -674,6 +887,18 @@ impl<U: Ui> App<U> {
             comment,
             weight: pa.weight,
         });
+        if std::mem::take(&mut self.draft.amending) {
+            let n = self.draft.postings.len();
+            let rest = self.draft.template.get(n..).unwrap_or_default();
+            let styles = &self.data().journal.styles;
+            // Otherwise (e.g. the amount left more than one commodity to balance)
+            // carry on prompting.
+            if let Some(postings) = finish(self.draft.postings.clone(), rest, styles) {
+                self.draft.postings = postings;
+                self.p.say(&self.render_transaction())?;
+                self.save_draft()?;
+            }
+        }
         Ok(answer)
     }
 
@@ -686,7 +911,7 @@ impl<U: Ui> App<U> {
                 "y" | "yes" => self.save_draft()?,
                 "n" | "no" => {
                     self.p.say("Discarded.\n")?;
-                    self.draft = Draft::default();
+                    self.draft = self.new_draft();
                 }
                 _ => self.p.error = Some("Please answer y or n (or < to go back).".into()),
             }
@@ -703,7 +928,7 @@ impl<U: Ui> App<U> {
         self.p
             .say(&format!("Saved to {}.\n", self.path.display()))?;
         self.last_date = self.draft.date;
-        self.draft = Draft::default();
+        self.draft = self.new_draft();
         Ok(())
     }
 
@@ -717,11 +942,12 @@ impl<U: Ui> App<U> {
 
 fn render_transaction(
     date: NaiveDate,
+    status: Status,
     description: &str,
     comment: Option<&str>,
     postings: &[Posting],
 ) -> String {
-    let mut s = format!("{date} {description}");
+    let mut s = format!("{date} {}{description}", status.mark());
     if let Some(c) = comment {
         s.push_str(&format!("  ; {c}"));
     }
@@ -938,6 +1164,161 @@ mod tests {
         assert_eq!(accounts, ["expenses:food", "assets:card"]);
     }
 
+    const CAFES: &str = "\
+2026-01-01 Blue Bottle Coffee
+    expenses:coffee    $4.00
+    liabilities:amex
+
+2026-01-02 Grocery Store
+    expenses:food    $40
+    assets:checking
+
+2026-01-03 Corner Store
+    expenses:food    $9
+    assets:checking
+
+2026-01-04 Sightglass
+    expenses:coffee    $5
+    liabilities:amex
+
+2026-01-05 Ritual
+    expenses:coffee    $4
+    liabilities:amex
+
+2026-01-06 Office Coffee
+    expenses:coffee    $2
+    assets:checking
+";
+
+    #[test]
+    fn borrows_accounts_from_a_similar_description() {
+        let data = Loaded::new(Journal::parse_str(CAFES));
+        assert_eq!(
+            data.borrow("Blue Bottle Roasters"),
+            Some(Borrowed {
+                source: "Blue Bottle Coffee".into(),
+                postings: tpl(&[("expenses:coffee", None), ("liabilities:amex", None)]),
+                sample: Some("$4.00".into()),
+            })
+        );
+        // Known descriptions keep their own template; weak overlaps lend nothing.
+        assert!(data.borrow("Grocery Store").is_none());
+        assert!(data.borrow("Main Street Store").is_none());
+        assert!(data.borrow("Joe's Pizza").is_none());
+        assert!(data.borrow("").is_none());
+    }
+
+    #[test]
+    fn suggests_accounts_that_go_with_those_entered() {
+        let data = Loaded::new(Journal::parse_str(CAFES));
+        let (boost, suggestion) = data.account_context(&["expenses:coffee"]);
+        // amex went with coffee 3 times out of 4, checking once.
+        assert_eq!(suggestion.as_deref(), Some("liabilities:amex"));
+        let points = |name| boost.get(&data.accounts.id(name).unwrap()).copied();
+        assert!(points("liabilities:amex") > points("assets:checking"));
+        assert_eq!(points("expenses:coffee"), None);
+        let (_, none) = data.account_context(&["expenses:food", "assets:checking"]);
+        assert_eq!(none, None);
+        assert_eq!(data.account_context(&[]).1, None);
+    }
+
+    #[test]
+    fn new_payees_get_borrowed_and_suggested_accounts() {
+        let dir = std::env::temp_dir().join(format!("ladder-app-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("j.journal");
+        std::fs::write(&path, CAFES).unwrap();
+        let loader = Loaded::spawn(path.clone(), Case::default());
+        // Borrowed accounts: Enter takes each; then a payee with nothing to borrow,
+        // where account 2 defaults to what usually goes with coffee.
+        let input = "2026-10-20\nBlue Bottle Roasters\n\n4.50\n\n\n\ny\n\
+                     \nSomewhere New\nexpenses:coffee\n$3\n\n\n\ny\n";
+        let ui = crate::ui::LineUi::new(input.as_bytes());
+        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        App::new(ui, path.clone(), loader, today, Vec::new())
+            .run()
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let added = &text[CAFES.len()..];
+        assert_eq!(
+            added,
+            "\n2026-10-20 Blue Bottle Roasters\n    expenses:coffee    $4.50\n    liabilities:amex  $-4.50\n\
+             \n2026-10-20 Somewhere New\n    expenses:coffee       $3\n    liabilities:amex  $-3.00\n"
+        );
+    }
+
+    /// Gives scripted answers, recording each prompt's label.
+    struct Script {
+        answers: VecDeque<Answer>,
+        labels: Vec<String>,
+    }
+
+    impl Ui for Script {
+        fn ask(&mut self, spec: &Spec) -> io::Result<Answer> {
+            self.labels.push(spec.label.clone());
+            Ok(match self.answers.pop_front() {
+                Some(Answer::Text(t)) if t.is_empty() => {
+                    Answer::Text(spec.default.clone().unwrap_or_default())
+                }
+                Some(a) => a,
+                None => Answer::Quit,
+            })
+        }
+
+        fn say(&mut self, _: &str) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ctrl_t_changes_only_the_amount() {
+        let dir = std::env::temp_dir().join(format!("ladder-amend-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("j.journal");
+        std::fs::write(&path, CAFES).unwrap();
+        let loader = Loaded::spawn(path.clone(), Case::default());
+        let text = |t: &str| Answer::Text(t.into());
+        // Ctrl-T on a description, then on a different account 1, whose amount
+        // defaults to the one just saved.
+        let answers = [
+            text("2026-10-20"),
+            Answer::Amend("Blue Bottle Coffee".into()),
+            text("6"),
+            text(""),
+            text("Blue Bottle Coffee"),
+            Answer::Amend("expenses:food".into()),
+            text(""),
+        ];
+        let ui = Script {
+            answers: answers.into(),
+            labels: Vec::new(),
+        };
+        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let mut app = App::new(ui, path.clone(), loader, today, Vec::new());
+        app.run().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            app.p.ui.labels,
+            [
+                "Date",
+                "Description",
+                "Amount 1 for expenses:coffee",
+                "Date",
+                "Description",
+                "Account 1",
+                "Amount 1 for expenses:food",
+                "Date",
+            ]
+        );
+        assert_eq!(
+            &text[CAFES.len()..],
+            "\n2026-10-20 Blue Bottle Coffee\n    expenses:coffee    $6.00\n    liabilities:amex  $-6.00\n\
+             \n2026-10-20 Blue Bottle Coffee\n    expenses:food      $6.00\n    liabilities:amex  $-6.00\n"
+        );
+    }
+
     #[test]
     fn fills_the_one_missing_amount() {
         let styles = dollars();
@@ -995,8 +1376,12 @@ mod tests {
         );
         let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
         assert_eq!(
-            render_transaction(date, "Grocer", None, &p),
+            render_transaction(date, Status::Unmarked, "Grocer", None, &p),
             "2026-10-19 Grocer\n    expenses:food      $5\n    cash           $-5.00\n"
+        );
+        assert_eq!(
+            render_transaction(date, Status::Cleared, "Grocer", Some("weekly"), &p),
+            "2026-10-19 * Grocer  ; weekly\n    expenses:food      $5\n    cash           $-5.00\n"
         );
     }
 }

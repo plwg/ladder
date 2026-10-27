@@ -1,7 +1,7 @@
 //! Prompting: an inline raw-mode editor with a live fuzzy dropdown, and a plain
 //! line-based fallback used when stdin isn't a terminal.
 
-use crate::fuzzy::{Index, Searcher};
+use crate::fuzzy::{Boost, Index, Searcher};
 use crossterm::cursor::{MoveToColumn, MoveUp};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
@@ -19,9 +19,13 @@ pub struct Spec<'a> {
     /// Text the input starts with (e.g. the old answer after going back).
     pub initial: String,
     pub completion: Option<&'a Index>,
+    /// Extra ranking points for some completions in this prompt.
+    pub boost: Option<&'a Boost>,
     /// The complete result of the answer Enter would give, shown in a box under the
     /// prompt; Ctrl-Y accepts it as is. `None` when that answer needs more input.
     pub preview: Option<&'a PreviewFn<'a>>,
+    /// Whether Ctrl-T can take the preview with this prompt's posting's amount changed.
+    pub amend: bool,
     pub hint: Option<String>,
     pub error: Option<String>,
 }
@@ -33,7 +37,9 @@ impl<'a> Spec<'a> {
             default: None,
             initial: String::new(),
             completion: None,
+            boost: None,
             preview: None,
+            amend: false,
             hint: None,
             error: None,
         }
@@ -52,6 +58,8 @@ pub enum Answer {
     Text(String),
     /// An answer given with Ctrl-Y: take its preview as is.
     Accept(String),
+    /// An answer given with Ctrl-T: take its preview, but ask for this posting's amount.
+    Amend(String),
     Back,
     Quit,
 }
@@ -166,7 +174,7 @@ impl<'s, 'a> Editor<'s, 'a> {
     fn refresh(&mut self) {
         if let Some(index) = self.spec.completion {
             let q = self.text();
-            self.searcher.search(index, &q);
+            self.searcher.search_boosted(index, &q, self.spec.boost);
             let has = !q.trim().is_empty() && !self.searcher.results.is_empty();
             self.selected = has.then_some(0);
             self.scroll = 0;
@@ -272,6 +280,10 @@ impl<'s, 'a> Editor<'s, 'a> {
             },
             KeyCode::Char('y') if ctrl => match self.pending() {
                 Some(t) if self.preview().is_some() => Outcome::Done(Answer::Accept(t)),
+                _ => Outcome::MOVED,
+            },
+            KeyCode::Char('t') if ctrl && self.spec.amend => match self.pending() {
+                Some(t) if self.preview().is_some() => Outcome::Done(Answer::Amend(t)),
                 _ => Outcome::MOVED,
             },
             KeyCode::Char('c') if ctrl => Outcome::Done(Answer::Quit),
@@ -449,33 +461,34 @@ impl<'s, 'a> Editor<'s, 'a> {
             lines += 1;
         }
         if let Some(index) = self.spec.completion {
-            let end = (self.scroll + self.visible_rows()).min(self.searcher.results.len());
-            for row in self.scroll..end {
-                let id = self.searcher.results[row];
-                let item = index.get(id);
-                let hl = self.searcher.highlight(index, id);
-                let selected = self.selected == Some(row);
+            // The list always takes all its rows, so the status line and the box
+            // below it stay put however many matches there are.
+            let rows = self.visible_rows();
+            for row in self.scroll..self.scroll + rows {
                 out.queue(Print("\r\n"))?;
-                render_row(out, &item.text, &hl, selected, width)?;
+                if let Some(&id) = self.searcher.results.get(row) {
+                    let item = index.get(id);
+                    let hl = self.searcher.highlight(index, id);
+                    let selected = self.selected == Some(row);
+                    render_row(out, &item.text, &hl, selected, width)?;
+                }
                 lines += 1;
             }
-            if self.searcher.total > 0 {
-                let pos = self
-                    .selected
-                    .map_or(String::new(), |i| format!("{}/", i + 1));
-                let status = format!(
-                    "  {pos}{} matches · ↑↓ select · Tab insert · Alt-Enter as typed",
-                    self.searcher.total
-                );
-                queue!(
-                    out,
-                    Print("\r\n"),
-                    SetForegroundColor(Color::DarkGrey),
-                    Print(truncate(&status, width)),
-                    ResetColor
-                )?;
-                lines += 1;
-            }
+            let pos = self
+                .selected
+                .map_or(String::new(), |i| format!("{}/", i + 1));
+            let status = format!(
+                "  {pos}{} matches · ↑↓ select · Tab insert · Alt-Enter as typed",
+                self.searcher.total
+            );
+            queue!(
+                out,
+                Print("\r\n"),
+                SetForegroundColor(Color::DarkGrey),
+                Print(truncate(&status, width)),
+                ResetColor
+            )?;
+            lines += 1;
         }
         if let Some(h) = &self.spec.hint {
             queue!(
@@ -493,7 +506,12 @@ impl<'s, 'a> Editor<'s, 'a> {
                 out.queue(Print("\r\n"))?;
                 lines += 1;
             }
-            lines += render_preview(out, &p, width)?;
+            let title = if self.spec.amend {
+                " Ctrl-Y saves this · Ctrl-T edits the amount "
+            } else {
+                " Ctrl-Y saves this "
+            };
+            lines += render_preview(out, &p, title, width)?;
         }
         if lines > 0 {
             out.queue(MoveUp(lines))?;
@@ -514,15 +532,16 @@ fn truncate(s: &str, width: usize) -> String {
 }
 
 /// Draw `text` in a box whose bottom edge is titled with how to accept it; returns the lines used.
-fn render_preview(out: &mut impl Write, text: &str, width: usize) -> io::Result<u16> {
-    const TITLE: &str = " Ctrl-Y saves this ";
+fn render_preview(out: &mut impl Write, text: &str, title: &str, width: usize) -> io::Result<u16> {
     let body: Vec<&str> = text.lines().take(MAX_PREVIEW_ROWS).collect();
     let text_width = |s: &str| s.chars().map(char_width).sum::<usize>();
+    let title = truncate(title, width.saturating_sub(4));
+    let title_width = text_width(&title);
     // Inner width: the widest line plus a space either side, within the terminal.
     let inner = body
         .iter()
         .map(|l| text_width(l) + 2)
-        .chain([TITLE.len() + 2])
+        .chain([title_width + 2])
         .max()
         .unwrap_or(0)
         .min(width.saturating_sub(2));
@@ -542,8 +561,8 @@ fn render_preview(out: &mut impl Write, text: &str, width: usize) -> io::Result<
         queue!(out, Print(" "), Print(&shown), Print(pad))?;
         dim(out, "│")?;
     }
-    let fill = inner.saturating_sub(TITLE.len() + 1);
-    dim(out, &format!("\r\n╰─{TITLE}{}╯", "─".repeat(fill)))?;
+    let fill = inner.saturating_sub(title_width + 1);
+    dim(out, &format!("\r\n╰─{title}{}╯", "─".repeat(fill)))?;
     Ok(body.len() as u16 + 2)
 }
 
@@ -611,7 +630,7 @@ impl Ui for TermUi {
                     match ed.key(k) {
                         Outcome::Done(answer) => {
                             let shown = match &answer {
-                                Answer::Text(t) | Answer::Accept(t) => t.clone(),
+                                Answer::Text(t) | Answer::Accept(t) | Answer::Amend(t) => t.clone(),
                                 _ => ed.text(),
                             };
                             queue!(self.out, MoveToColumn(0), Clear(ClearType::FromCursorDown))?;

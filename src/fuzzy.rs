@@ -31,6 +31,10 @@ pub struct Index {
     weights: Weights,
 }
 
+/// Extra points for some items in one search, by id: e.g. accounts that usually go
+/// with the ones already in the transaction.
+pub type Boost = FxHashMap<u32, u32>;
+
 /// How usage history is turned into a ranking bonus (one matched char is worth ~16).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Weights {
@@ -41,6 +45,9 @@ pub struct Weights {
     /// Extra points for the last few distinct items used, most recent first, so a
     /// run of transactions against the same account or payee keeps it at the top.
     pub recent_boost: Vec<u32>,
+    /// Points for an account that always appeared with one already in the
+    /// transaction (scaled by how often it did).
+    pub context: f64,
 }
 
 impl Default for Weights {
@@ -49,6 +56,7 @@ impl Default for Weights {
             freq_step: 2,
             recency: 10.0,
             recent_boost: vec![12, 10, 8, 6, 4, 2],
+            context: 32.0,
         }
     }
 }
@@ -212,13 +220,33 @@ impl Searcher {
     }
 
     pub fn search(&mut self, index: &Index, query: &str) {
+        self.search_boosted(index, query, None);
+    }
+
+    /// Search with `boost` added to the matching items' scores.
+    pub fn search_boosted(&mut self, index: &Index, query: &str, boost: Option<&Boost>) {
         if !std::ptr::eq(self.index, index) {
             self.index = index;
             self.pool = None;
         }
         if query.trim().is_empty() {
             self.results.clear();
-            self.results.extend(index.by_bonus.iter().take(LIMIT));
+            match boost.filter(|b| !b.is_empty()) {
+                None => self.results.extend(index.by_bonus.iter().take(LIMIT)),
+                Some(boost) => {
+                    // Only boosted items can climb into the top LIMIT by bonus.
+                    let mut ids: Vec<u32> = index.by_bonus.iter().take(LIMIT).copied().collect();
+                    ids.extend(boost.keys().filter(|&&id| (id as usize) < index.len()));
+                    ids.sort_unstable();
+                    ids.dedup();
+                    let total = |id: u32| {
+                        index.items[id as usize].bonus + boost.get(&id).copied().unwrap_or(0)
+                    };
+                    ids.sort_unstable_by_key(|&id| (Reverse(total(id)), id));
+                    ids.truncate(LIMIT);
+                    self.results = ids;
+                }
+            }
             self.total = index.len();
             self.query.clear();
             self.pool = None;
@@ -228,7 +256,7 @@ impl Searcher {
         let candidates = if reuse { self.pool.take() } else { None };
         self.pattern
             .reparse(query, CaseMatching::Smart, Normalization::Smart);
-        let mut scored = self.score(index, candidates.as_deref());
+        let mut scored = self.score(index, candidates.as_deref(), boost);
         self.total = scored.len();
         self.pool = Some(scored.iter().map(|&(_, id)| id).collect());
         self.query.clear();
@@ -246,7 +274,12 @@ impl Searcher {
         self.results.extend(scored.iter().map(|&(_, id)| id));
     }
 
-    fn score(&mut self, index: &Index, candidates: Option<&[u32]>) -> Vec<(u32, u32)> {
+    fn score(
+        &mut self,
+        index: &Index,
+        candidates: Option<&[u32]>,
+        boost: Option<&Boost>,
+    ) -> Vec<(u32, u32)> {
         let n = candidates.map_or(index.len(), <[u32]>::len);
         let id_at = |i: usize| candidates.map_or(i as u32, |c| c[i]);
         let pattern = &self.pattern;
@@ -256,7 +289,8 @@ impl Searcher {
                 let id = id_at(i);
                 let item = &index.items[id as usize];
                 if let Some(s) = pattern.score(item.hay.slice(..), matcher) {
-                    out.push((s + item.bonus, id));
+                    let extra = boost.and_then(|b| b.get(&id)).copied().unwrap_or(0);
+                    out.push((s + item.bonus + extra, id));
                 }
             }
             out
@@ -378,6 +412,31 @@ mod tests {
         // A clearly better match still wins over recency.
         s.search(&ix, "alpha");
         assert_eq!(texts(&ix, &s), ["assets:bank:alpha"]);
+    }
+
+    #[test]
+    fn boost_reorders_close_matches_only() {
+        let usage = |count, last_seq| Usage { count, last_seq };
+        let ix = Index::build(vec![
+            ("assets:checking".into(), usage(50, 100)),
+            ("liabilities:card".into(), usage(5, 10)),
+            ("liabilities:cash".into(), usage(5, 11)),
+        ]);
+        let card = ix.id("liabilities:card").unwrap();
+        let boost = Boost::from_iter([(card, 30)]);
+        let mut s = Searcher::new();
+        s.search(&ix, "");
+        assert_eq!(texts(&ix, &s)[0], "assets:checking");
+        s.search_boosted(&ix, "", Some(&boost));
+        assert_eq!(
+            texts(&ix, &s),
+            ["liabilities:card", "assets:checking", "liabilities:cash"]
+        );
+        s.search_boosted(&ix, "li", Some(&boost));
+        assert_eq!(texts(&ix, &s)[0], "liabilities:card");
+        // A clearly better match still wins.
+        s.search_boosted(&ix, "cash", Some(&boost));
+        assert_eq!(texts(&ix, &s)[0], "liabilities:cash");
     }
 
     #[test]
