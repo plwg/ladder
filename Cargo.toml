@@ -5,7 +5,6 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
-anyhow = "1.0.104"
 chrono = "0.4.45"
 crossterm = "0.29.0"
 nucleo-matcher = "0.3.1"
