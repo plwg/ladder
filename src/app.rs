@@ -7,7 +7,7 @@ use crate::fuzzy::{Boost, Index, Weights};
 use crate::journal::{Journal, TemplatePosting, Usage, strip_wrap};
 use crate::status::Status;
 use crate::ui::{Answer, Spec, Ui};
-use chrono::NaiveDate;
+use jiff::civil::Date;
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
@@ -274,7 +274,7 @@ struct Posting {
 
 #[derive(Default)]
 struct Draft {
-    date: Option<NaiveDate>,
+    date: Option<Date>,
     description: Option<String>,
     comment: Option<String>,
     template: Vec<TemplatePosting>,
@@ -537,8 +537,8 @@ pub struct App<U: Ui> {
     path: PathBuf,
     loader: Option<JoinHandle<io::Result<Loaded>>>,
     data: Option<Loaded>,
-    today: NaiveDate,
-    last_date: Option<NaiveDate>,
+    today: Date,
+    last_date: Option<Date>,
     draft: Draft,
     status: Status,
 }
@@ -548,7 +548,7 @@ impl<U: Ui> App<U> {
         ui: U,
         path: PathBuf,
         loader: JoinHandle<io::Result<Loaded>>,
-        today: NaiveDate,
+        today: Date,
         args: Vec<String>,
     ) -> Self {
         App {
@@ -941,7 +941,7 @@ impl<U: Ui> App<U> {
 }
 
 fn render_transaction(
-    date: NaiveDate,
+    date: Date,
     status: Status,
     description: &str,
     comment: Option<&str>,
@@ -1027,7 +1027,7 @@ mod tests {
     fn grocer(entered: &[(&str, &str)], pending: Option<&str>) -> Draft {
         let styles = dollars();
         Draft {
-            date: NaiveDate::from_ymd_opt(2026, 10, 19),
+            date: Some(jiff::civil::date(2026, 10, 19)),
             description: Some("Grocer".into()),
             template: tpl(&[("expenses:food", Some("$42.10")), ("assets:checking", None)]),
             postings: entered
@@ -1234,7 +1234,7 @@ mod tests {
         let input = "2026-10-20\nBlue Bottle Roasters\n\n4.50\n\n\n\ny\n\
                      \nSomewhere New\nexpenses:coffee\n$3\n\n\n\ny\n";
         let ui = crate::ui::LineUi::new(input.as_bytes());
-        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let today = jiff::civil::date(2026, 10, 20);
         App::new(ui, path.clone(), loader, today, Vec::new())
             .run()
             .unwrap();
@@ -1294,7 +1294,7 @@ mod tests {
             answers: answers.into(),
             labels: Vec::new(),
         };
-        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let today = jiff::civil::date(2026, 10, 20);
         let mut app = App::new(ui, path.clone(), loader, today, Vec::new());
         app.run().unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -1374,7 +1374,7 @@ mod tests {
             &tpl(&[("expenses:food", Some("$5")), ("cash", None)]),
             &styles,
         );
-        let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let date = jiff::civil::date(2026, 10, 19);
         assert_eq!(
             render_transaction(date, Status::Unmarked, "Grocer", None, &p),
             "2026-10-19 Grocer\n    expenses:food      $5\n    cash           $-5.00\n"
