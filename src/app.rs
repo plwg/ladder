@@ -667,7 +667,7 @@ impl<U: Ui> App<U> {
                 Some(d) => self.draft.date = Some(d),
                 None => {
                     let e = format!(
-                        "Can't understand date {t:?} (try 2026-10-19, 10/19, 19, today, yesterday, -3)"
+                        "Can't understand date {t:?} (try 2026-10-19, 10/19, 19, today, yesterday, -3, fri, 2w ago)"
                     );
                     self.p.retry(e, t);
                 }
