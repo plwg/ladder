@@ -118,7 +118,7 @@ fn main() -> ExitCode {
     let path = file.unwrap_or_else(default_journal);
     // Parse the journal and build the search indexes while the user types the date.
     let loader = Loaded::spawn(path.clone(), case);
-    let today = chrono::Local::now().date_naive();
+    let today = jiff::ZonedDateTime::now().date();
 
     let result = if io::stdin().is_terminal() && io::stdout().is_terminal() {
         let default_hook = std::panic::take_hook();
