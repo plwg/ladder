@@ -90,7 +90,13 @@ The usual editing keys also work: Ctrl-A, Ctrl-E, Ctrl-W, Ctrl-U and Ctrl-K.
   the commodity's precision, shown as `= S$16.67`, and written to the journal as
   a plain amount.
 - **Dates**: `today`, `y`, `tomorrow`, `-3`, `+2`, `19`, `10/19`,
-  `2026-10-19` and `20261019`.
+  `2026-10-19` and `20261019`. Also:
+  - weekdays: `fri` or `friday` is the latest Friday (today if it is one),
+    `last fri` the one before today, `next fri` the one after;
+  - `som` and `eom` for the first and last day of this month;
+  - spans from today: `3d`, `2w ago`, `-1mo`, `1 month 3 days`, `1y ago`. A month
+    or year that lands past a month's end uses its last day (Jan 31 + `1mo` is
+    Feb 28).
 - **Comments**: text after `;` in a description or amount is kept as a comment.
 - **Journal support**: `include` files, `account` and `commodity` directives,
   `comment` blocks, virtual postings, and prices (`@`, `@@`) when checking

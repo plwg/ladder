@@ -22,7 +22,7 @@ accounts, so most transactions take only a few keystrokes.
   it straight away, or Ctrl-T to change just the amount first.
 - **Automatic balancing and arithmetic**: the last amount fills itself in, and
   amounts can be expressions like `45.80 + 4.20`.
-- **Flexible dates** such as `today`, `y`, `-3` or `10/19`.
+- **Flexible dates** such as `today`, `y`, `-3`, `10/19`, `fri` or `2w ago`.
 - **Works with your existing journal**, including `include` files, directives,
   comments and prices.
 
