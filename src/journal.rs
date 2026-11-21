@@ -98,6 +98,20 @@ fn strip_comment(s: &str) -> &str {
     s.find(';').map_or(s, |i| &s[..i]).trim()
 }
 
+/// `amount` without its balance assertion (`= $100`, `==* $100`), which a later
+/// transaction can't reuse. A quoted commodity may contain `=`.
+fn strip_assertion(amount: &str) -> &str {
+    let mut quoted = false;
+    let end = amount
+        .char_indices()
+        .find(|&(_, c)| {
+            quoted ^= c == '"';
+            c == '=' && !quoted
+        })
+        .map_or(amount.len(), |(i, _)| i);
+    amount[..end].trim_end()
+}
+
 /// Split a posting line into (account as written, amount); `None` for comment lines.
 fn split_posting(line: &str) -> Option<(&str, Option<&str>)> {
     let mut t = line.trim_start();
@@ -191,7 +205,8 @@ impl Journal {
         self.acct_ix.get(name).map(|&i| &self.accounts[i as usize])
     }
 
-    /// Postings of the most recent transaction with this description.
+    /// Postings of the most recent transaction with this description, without
+    /// balance assertions.
     pub fn template(&self, description: &str) -> Vec<TemplatePosting> {
         let Some(d) = self.description(description) else {
             return Vec::new();
@@ -203,7 +218,10 @@ impl Journal {
             .filter_map(split_posting)
             .map(|(account, amount)| TemplatePosting {
                 account: account.to_owned(),
-                amount: amount.map(str::to_owned),
+                amount: amount
+                    .map(strip_assertion)
+                    .filter(|a| !a.is_empty())
+                    .map(str::to_owned),
             })
             .collect()
     }
@@ -535,6 +553,29 @@ end comment
             account: account.into(),
             amount: amount.map(Into::into),
         }
+    }
+
+    #[test]
+    fn template_drops_balance_assertions() {
+        let j = Journal::parse_str(
+            "2026-01-01 Paycheck
+    assets:checking        $1,000 = $5,000
+    assets:savings         $200 @@ €180 == $900
+    assets:cash            =* $50
+    assets:fx              3 \"A=B\" = 10 \"A=B\"  ; note
+    income:salary
+",
+        );
+        assert_eq!(
+            j.template("Paycheck"),
+            [
+                tp("assets:checking", Some("$1,000")),
+                tp("assets:savings", Some("$200 @@ €180")),
+                tp("assets:cash", None),
+                tp("assets:fx", Some("3 \"A=B\"")),
+                tp("income:salary", None),
+            ]
+        );
     }
 
     #[test]
